@@ -1,7 +1,7 @@
 # PRAMIGO: A Heterogenous Graph Transformer approach to target multi-omic integrated programs
 
 <p align="center">
-  <img src="docs/fig1b.pdf" width="600">
+  <img src="docs/pramigopy.png" width="600">
 </p>
 
 ## 📥 Setup & Installation
