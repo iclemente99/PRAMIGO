@@ -16,23 +16,12 @@ git clone https://github.com/iclemente99/PRAMIGO
 
 ### 2. HGT Environment
 
-OPTION 1 - Create conda HGT environment
-
-```bash
-
-conda env create -f env/hgt_env.yml
-conda activate hgt_env
-
-```
-
-OPTION 2 - Create uv HGT environment
-
 ```bash
 
 curl -LsSf https://astral.sh/uv/install.sh | sh # Just once to use uv
 uv venv hgt_env
 source hgt_env/bin/activate
-uv pip install -r env/hgt_env.txt
+uv pip install -r env/biomix_hgt.txt
 
 ```
 
@@ -52,10 +41,10 @@ This function loads the data, trains the model, saves the results and creates th
 
 ## 🎯 Important considerations
 
-- You can see that the input are paths to the files.
-- Metadata is expected to be a TSV that contains at least "ID" column with the samples identifiers and "CONDITION" with the condition groups as it's in MTB and EGA datasets.
-- Omic1 and Omic2 are expected to be CSV that contains the column "ID" on the left with the samples identifiers. THESE SHOULD BE THE FILTERED MATRICES. The function won't filter.
-- Results_dir will save all the results with in different folders inside it with the embeddings, the trained model, visualization plots and so on.
+- Input - are paths to the files.
+- Metadata - is expected to be a TSV that contains at least "ID" column with the samples identifiers and "CONDITION" with the condition groups as it's in MTB and EGA datasets.
+- Omic1 and Omic2 - are expected to be CSV that contains the column "ID" on the left with the samples identifiers. THESE SHOULD BE THE FILTERED AND NORMALIZED MATRICES. The function won't do any of both processing.
+- Results_dir - will save all the results with in different folders inside it with the embeddings, the trained model, visualization plots and so on.
 
 ## ✍️ Citation & Acknowledgements
 
