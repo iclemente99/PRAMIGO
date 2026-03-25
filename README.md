@@ -31,9 +31,9 @@ The main function is src/biomix_hgt.py - this is the one you'll need to run and 
 
 ```bash
 python src/biomix_hgt.py \
-  --metadata_path "./data/EGA/Metadata/EGAS00001001746_metadata_CLL.tsv" \
-  --omic1_path "./data/EGA_omic1.csv" \
-  --omic2_path "./data/EGA_omic2.csv" \
+  --metadata_path "./data/EGAS00001001746/EGAS00001001746_metadata_CLL.tsv" \
+  --omic1_path "./data/EGAS00001001746/EGAS00001001746_transcriptomics.csv" \
+  --omic2_path "./data/EGAS00001001746/EGAS00001001746_methylomics.csv" \
   --result_dir "./data/EGA_biomix"
 ```
 
