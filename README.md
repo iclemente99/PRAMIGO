@@ -36,6 +36,7 @@ PRAMIGO expects three TSV files:
 | `--omic2_path` | Features × samples, `ID` column first (e.g. metabolomics) |
 
 > ⚠️ **The omic matrices must already be filtered and normalized.** PRAMIGO does **not** perform any filtering, batch correction, or normalization of its own — it consumes the matrices as-is and builds the correlation graph directly from them. Feed it raw or poorly-normalized data and the feature-feature correlation graph (and everything downstream of it) will reflect that noise. A standard choice is per-feature (row-wise) z-scoring after your usual QC/filtering pipeline — see [Simulated toy data](#-simulated-toy-data) below for a worked example of exactly this format. 
+
 > As a general recommendation, we suggest using a **row-wise normalized matrix restricted to the significantly different omic features** identified between groups within each modality.
 
 ---
@@ -169,7 +170,7 @@ It provisions a fresh `uv` environment from `env/biomixhgt_env.txt`, then runs t
 
 ## ✍️ Citation & Acknowledgements
 
-This work was developed at through the BiomiX consortium (https://github.com/IxI-97/BiomiX). Please cite accordingly if used in academic research.
+This work was developed through the BiomiX consortium (https://github.com/IxI-97/BiomiX). Please cite accordingly if used in academic research.
 
 ## 🖥️ Maintainers
 
