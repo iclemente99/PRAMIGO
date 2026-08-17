@@ -4,7 +4,7 @@
   <img src="docs/pramigopy.png" width="900">
 </p>
 
-PRAMIGO builds a heterogeneous graph over **samples, genes, and metabolites** (or any two omic layers), trains a Heterogeneous Graph Transformer (HGT) on it, and returns embeddings, attention-based interpretability, and cluster-level "programs" of co-regulated features — all from a single command.
+PRAMIGO builds a heterogeneous graph over **samples and any two omic layers**, trains a Heterogeneous Graph Transformer (HGT) on it, and returns embeddings, attention-based interpretability, and cluster-level "programs" of co-regulated features — all from a single command.
 
 ---
 
@@ -35,7 +35,8 @@ PRAMIGO expects three TSV files:
 | `--omic1_path` | Features × samples, `ID` column first (e.g. gene expression) |
 | `--omic2_path` | Features × samples, `ID` column first (e.g. metabolomics) |
 
-> ⚠️ **The omic matrices must already be filtered and normalized.** PRAMIGO does **not** perform any filtering, batch correction, or normalization of its own — it consumes the matrices as-is and builds the correlation graph directly from them. Feed it raw or poorly-normalized data and the feature-feature correlation graph (and everything downstream of it) will reflect that noise. A standard choice is per-feature (row-wise) z-scoring after your usual QC/filtering pipeline — see [Simulated toy data](#-simulated-toy-data) below for a worked example of exactly this format.
+> ⚠️ **The omic matrices must already be filtered and normalized.** PRAMIGO does **not** perform any filtering, batch correction, or normalization of its own — it consumes the matrices as-is and builds the correlation graph directly from them. Feed it raw or poorly-normalized data and the feature-feature correlation graph (and everything downstream of it) will reflect that noise. A standard choice is per-feature (row-wise) z-scoring after your usual QC/filtering pipeline — see [Simulated toy data](#-simulated-toy-data) below for a worked example of exactly this format. 
+> As a general recommendation, we suggest using a **row-wise normalized matrix restricted to the significantly different omic features** identified between groups within each modality.
 
 ---
 
@@ -111,7 +112,7 @@ Everything is written under `--result_dir`, organized into subfolders:
 |---|---|
 | `model/` | `checkpoint_latest.pt` (resumable training state) and the final trained model |
 | `loss/` | Per-epoch CSVs: total, validation, cosine, and cross-entropy loss history |
-| `gene/`, `metabo/`, `sample/` | Learned embedding matrices for each node type |
+| `omic1/`, `omic2/`, `sample/` | Learned embedding matrices for each node type |
 | `embeddings/` | Classifier-head embeddings at each hidden layer (128 / 64 / 32-dim) plus final class embeddings |
 | `att/` | Per-node attention scores as CSV — the main interpretability output |
 | `plots/` | Core visualizations (see below), always generated |
@@ -168,7 +169,7 @@ It provisions a fresh `uv` environment from `env/biomixhgt_env.txt`, then runs t
 
 ## ✍️ Citation & Acknowledgements
 
-This work was developed at LBAI-UBO. Please cite accordingly if used in academic research.
+This work was developed at through the BiomiX consortium (https://github.com/IxI-97/BiomiX). Please cite accordingly if used in academic research.
 
 ## 🖥️ Maintainers
 
