@@ -1,0 +1,41 @@
+Omic	Feature	Is_Differentially_Expressed	Marker_Of_Group
+omic1	omic1_DE_1	True	GroupA
+omic1	omic1_DE_2	True	GroupB
+omic1	omic1_DE_3	True	GroupC
+omic1	omic1_DE_4	True	GroupA
+omic1	omic1_DE_5	True	GroupB
+omic1	omic1_DE_6	True	GroupC
+omic1	omic1_DE_7	True	GroupA
+omic1	omic1_DE_8	True	GroupB
+omic1	omic1_DE_9	True	GroupC
+omic1	omic1_DE_10	True	GroupA
+omic1	omic1_noise_1	False	
+omic1	omic1_noise_2	False	
+omic1	omic1_noise_3	False	
+omic1	omic1_noise_4	False	
+omic1	omic1_noise_5	False	
+omic1	omic1_noise_6	False	
+omic1	omic1_noise_7	False	
+omic1	omic1_noise_8	False	
+omic1	omic1_noise_9	False	
+omic1	omic1_noise_10	False	
+omic2	omic2_DE_1	True	GroupA
+omic2	omic2_DE_2	True	GroupB
+omic2	omic2_DE_3	True	GroupC
+omic2	omic2_DE_4	True	GroupA
+omic2	omic2_DE_5	True	GroupB
+omic2	omic2_DE_6	True	GroupC
+omic2	omic2_DE_7	True	GroupA
+omic2	omic2_DE_8	True	GroupB
+omic2	omic2_DE_9	True	GroupC
+omic2	omic2_DE_10	True	GroupA
+omic2	omic2_noise_1	False	
+omic2	omic2_noise_2	False	
+omic2	omic2_noise_3	False	
+omic2	omic2_noise_4	False	
+omic2	omic2_noise_5	False	
+omic2	omic2_noise_6	False	
+omic2	omic2_noise_7	False	
+omic2	omic2_noise_8	False	
+omic2	omic2_noise_9	False	
+omic2	omic2_noise_10	False	
