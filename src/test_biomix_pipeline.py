@@ -295,7 +295,7 @@ class TestPipelineEndToEnd:
         plots_dir = os.path.join(result_dir, "plots")
         for filename in [
             "leiden_clusters_composition.csv",
-            "leiden_cluster_network_nature_style.pdf",
+            "leiden_cluster_network.pdf",
             "leiden_cluster_subgraphs.pdf",
             "leiden_program_activity_scores.csv",
             "leiden_program_activity_report.pdf",
@@ -310,7 +310,7 @@ class TestPipelineEndToEnd:
             "roc_curves.pdf", "per_class_performance.pdf",
             "attention_concentration_by_omic.pdf", "attention_distribution_by_omic.pdf",
             "embedding_separability_silhouette.pdf", "embedding_pca_scree.pdf",
-            "network_static_publication.pdf", "network_hub_nodes.pdf",
+            "network_hub_nodes.pdf",
         ]
         for filename in expected:
             assert os.path.exists(os.path.join(supplementary_dir, filename)), f"Missing supplementary output: {filename}"

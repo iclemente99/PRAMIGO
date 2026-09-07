@@ -104,91 +104,6 @@ def get_condition_palette(condition_values):
     return {cond: OKABE_ITO[i % len(OKABE_ITO)] for i, cond in enumerate(uniq)}
 
 
-def robust_layout(graph, seed=42, scale=1.0, gap=2.5):
-    """Kamada-Kawai layout that stays well-behaved on graphs with isolated nodes
-    or several disconnected components - both are routine here (a correlation/
-    attention-filtered feature graph regularly leaves nodes with no same-type
-    partner). Calling nx.kamada_kawai_layout on the *whole* graph at once makes
-    every node pair - including pairs sitting in different components - part of
-    the same distance matrix; components (or lone isolated nodes) end up placed
-    an enormous, disproportionate distance from everything else, so the actual
-    network collapses into a speck in one corner of an otherwise blank canvas.
-    Laying out each connected component on its own (where Kamada-Kawai only
-    ever sees reachable, finite-distance pairs) and then tiling the components
-    on a simple grid keeps every component's true internal geometry while
-    making it impossible for cross-component "distance" to warp the layout.
-
-    Also corrects a second, more subtle issue: everywhere else in this script,
-    a bigger 'weight' means "more related" (more attention, stronger link). But
-    nx.kamada_kawai_layout's `weight` parameter is a target *distance* - bigger
-    weight pushes a pair *further apart*, not closer. Passed through unchanged,
-    the single strongest edge in the graph ends up stretched the *furthest*
-    apart of all, which then forces every properly-weaker-and-closer pair to be
-    rescaled down into an indistinguishable clump next to it. So: normalize the
-    raw weights once across the whole graph, then invert them into a bounded
-    'kk_distance' edge attribute (high attention -> short distance) before
-    laying anything out.
-    """
-    if graph.number_of_nodes() == 0:
-        return {}
-
-    raw_weights = np.array([d.get('weight', 1.0) for _, _, d in graph.edges(data=True)])
-    if len(raw_weights):
-        wmin, wmax = raw_weights.min(), raw_weights.max()
-        for _, _, d in graph.edges(data=True):
-            attraction = 0.1 + 0.9 * ((d.get('weight', 1.0) - wmin) / (wmax - wmin) if wmax > wmin else 0.5)
-            d['attraction'] = attraction        # spring_layout: bigger -> closer (already correct semantics)
-            d['kk_distance'] = 1.1 - attraction  # kamada_kawai: bigger -> further apart, so invert; bounded [0.1, 1.0]
-
-    components = [graph.subgraph(c).copy() for c in nx.connected_components(graph)]
-    components.sort(key=lambda c: c.number_of_nodes(), reverse=True)
-
-    def _layout_component(comp):
-        if comp.number_of_nodes() == 1:
-            return {next(iter(comp.nodes())): np.array([0.0, 0.0])}
-        try:
-            p = nx.kamada_kawai_layout(comp, weight='kk_distance')
-        except Exception:
-            p = nx.spring_layout(comp, seed=seed, k=None, iterations=300, weight='attraction')
-        xs = np.array([v[0] for v in p.values()])
-        ys = np.array([v[1] for v in p.values()])
-        cx, cy = xs.mean(), ys.mean()
-        spread = max(xs.max() - xs.min(), ys.max() - ys.min(), 1e-6)
-        return {n: np.array([(x - cx) / spread * scale, (y - cy) / spread * scale])
-                for n, (x, y) in p.items()}
-
-    n_comp = len(components)
-    grid_cols = max(1, int(np.ceil(np.sqrt(n_comp))))
-    pos = {}
-    for idx, comp in enumerate(components):
-        comp_pos = _layout_component(comp)
-        row, col = divmod(idx, grid_cols)
-        offset = np.array([col * gap * scale, -row * gap * scale])
-        for node, xy in comp_pos.items():
-            pos[node] = xy + offset
-    return pos
-
-
-def _frame_axes_to_pos(ax, pos, pad_fraction=0.08):
-    """Explicitly set axis limits from the actual node coordinates (plus a
-    small padding margin), instead of relying on matplotlib's autoscale after
-    nx.draw_networkx_* calls. This guarantees the saved figure always frames
-    exactly the plotted network - no leftover blank canvas and no content
-    pushed into a corner - regardless of the layout's absolute coordinate
-    scale."""
-    xs = [xy[0] for xy in pos.values()]
-    ys = [xy[1] for xy in pos.values()]
-    if not xs:
-        return
-    x_span = max(max(xs) - min(xs), 1e-6)
-    y_span = max(max(ys) - min(ys), 1e-6)
-    x_pad = x_span * pad_fraction
-    y_pad = y_span * pad_fraction
-    ax.set_xlim(min(xs) - x_pad, max(xs) + x_pad)
-    ax.set_ylim(min(ys) - y_pad, max(ys) + y_pad)
-    ax.set_aspect("equal")
-
-
 ################################################################
 #
 # DEEPMAPS PREPARATION FOR HGT PERFORMANCE
@@ -1414,7 +1329,7 @@ plt.close()
 #-----------------------------------------------------------------------
 # Isolates the attention subgraph among the top (<=300) genes/metabolites from the
 # plot above, clusters it with Leiden to find multi-omic "programs", and saves the
-# cluster composition (CSV) and a contracted cluster network (PDF).
+# cluster composition (CSV) and a Nature-style contracted cluster network (PDF).
 
 import igraph as ig
 import leidenalg
@@ -1589,16 +1504,12 @@ else:
         G_cluster.add_edge(cu, cv, weight=weight, edge_type=dominant_type, n_edges=len(types))
 
     # ────────────────────────────────────────────────
-    # Plot: contracted cluster network
+    # Plot: Nature-style cluster network
     # ────────────────────────────────────────────────
     if G_cluster.number_of_nodes() == 0:
         print("Leiden clustering: no clusters passed the minimum size filter, skipping network plot.")
     else:
-        # G_cluster's edge weight is a SUM over every contracted original edge, so it can
-        # range from 1 up into the hundreds - robust_layout() normalizes and inverts this
-        # internally before it ever reaches Kamada-Kawai (see its docstring). Edge width
-        # still encodes the true raw weight visually (see `widths` below).
-        pos = robust_layout(G_cluster, seed=seed)
+        pos = nx.spring_layout(G_cluster, k=1.2, iterations=500, seed=seed, weight='weight')
         n_cluster_nodes = G_cluster.number_of_nodes()
         cmap = plt.cm.get_cmap('tab20', n_cluster_nodes)
         node_color_by_id = {n: cmap(i) for i, n in enumerate(G_cluster.nodes())}
@@ -1650,7 +1561,7 @@ else:
                           edgecolor='#cccccc', linewidth=0.5, alpha=0.85),
                 zorder=5
             )
-        _frame_axes_to_pos(ax, pos)
+        ax.set_aspect("equal")
         ax.axis("off")
         ax.set_title(
             f"Multi-omic attention clusters (Leiden, top {len(top_feature_node_idx)} features, "
@@ -1676,7 +1587,7 @@ else:
             loc='lower left', fontsize=8, title='Program size', title_fontsize=8, labelspacing=1.2
         )
         plt.tight_layout()
-        cluster_pdf_path = plots_dir + "leiden_cluster_network.pdf"
+        cluster_pdf_path = plots_dir + "leiden_cluster_network_nature_style.pdf"
         plt.savefig(cluster_pdf_path, bbox_inches="tight", dpi=300)
         plt.close(fig)
         print(f"Leiden clustering: cluster network plot saved to {cluster_pdf_path}")
@@ -1701,7 +1612,7 @@ else:
 
         G_sub = G_full.subgraph(cluster_nodes).copy()
 
-        pos = robust_layout(G_sub, seed=seed)
+        pos = nx.spring_layout(G_sub, k=1.2, iterations=500, seed=seed, weight='weight')
 
         def norm_val(v, mn, mx):
             return (v - mn) / (mx - mn) if mx > mn else 0.5
@@ -1794,8 +1705,6 @@ else:
             f'({len(genes)} Genes · {len(metabolites)} Metabolites)',
             fontsize=13, fontweight='bold', pad=18
         )
-        _frame_axes_to_pos(ax, pos)
-        ax.axis('off')  # re-assert: set_aspect inside _frame_axes_to_pos doesn't affect visibility
         return fig
 
     if not valid_clusters:
@@ -2179,32 +2088,9 @@ for i, (label, shape, node_type) in zip(all_selected_indices, zip(node_labels, n
 valid_nodes = set(gene_indices).union(metabo_indices).union(sample_indices)
 attention_filtered = attention_network[
     (attention_network['source'].isin(valid_nodes)) & (attention_network['target'].isin(valid_nodes))
-].copy()
-
-# A single global 80th-percentile cutoff is edge-type-blind: HGT attention weights come
-# from per-relation-type attention heads, so gene-gene, gene-metabolite, gene-sample,
-# metabolite-sample, and sample-sample edges routinely sit on very different absolute
-# scales. Thresholding everything against one shared value lets whichever edge type
-# happens to have the largest typical attention (in practice, usually sample-sample)
-# crowd out survivors from every other type - most genes/metabolites are then left with
-# at most one surviving edge each (scattered, near-isolated dyads once plotted), while a
-# handful of sample nodes end up densely interconnected in one tight clump. Applying the
-# same 80th-percentile cutoff *within* each edge type instead keeps every relation type
-# proportionally represented among the survivors.
-idx_to_type = dict(zip(all_selected_indices, node_types))
-attention_filtered['source_type'] = attention_filtered['source'].map(idx_to_type)
-attention_filtered['target_type'] = attention_filtered['target'].map(idx_to_type)
-attention_filtered['edge_category'] = list(zip(
-    np.minimum(attention_filtered['source_type'], attention_filtered['target_type']),
-    np.maximum(attention_filtered['source_type'], attention_filtered['target_type'])
-))
-kept_chunks = []
-for _category, group in attention_filtered.groupby('edge_category'):
-    cat_threshold = np.percentile(group['weight'], 80)
-    kept_chunks.append(group[group['weight'] >= cat_threshold])
-attention_filtered = (
-    pd.concat(kept_chunks, ignore_index=True) if kept_chunks else attention_filtered.iloc[0:0]
-)
+]
+weight_threshold = np.percentile(attention_filtered['weight'], 80)
+attention_filtered = attention_filtered[attention_filtered['weight'] >= weight_threshold]
 
 # Normalize edge weights for layout
 #max_weight = attention_filtered['weight'].max()
@@ -2246,18 +2132,7 @@ for u, v in G.edges:
 plt.figure(figsize=(12, 12))
 
 # Node positions
-# After the top-N feature selection plus the 80th-percentile attention threshold, G
-# regularly contains isolated nodes or several disconnected components (a few hub/
-# sample nodes, many weakly- or un-linked ones). See the robust_layout() docstring
-# near the top of the file for why that specifically breaks a plain Kamada-Kawai
-# call, and how laying out each component separately fixes it.
-pos = robust_layout(G, seed=42)
-# Guard-rail: catch a degenerate/collapsed layout before it silently ships in a PDF.
-_pos_xs, _pos_ys = zip(*pos.values())
-if np.std(_pos_xs) < 0.05 or np.std(_pos_ys) < 0.05:
-    print(f"WARNING: full network layout looks degenerate "
-          f"(std_x={np.std(_pos_xs):.3f}, std_y={np.std(_pos_ys):.3f}) - "
-          f"check graph connectivity before plotting.")
+pos = nx.spring_layout(G, seed=42, k=0.3, iterations=100)
 
 #import plotly.graph_objects as go
 
@@ -2703,8 +2578,38 @@ plt.close(fig)
 print("Supplementary: embedding separability / PCA scree figures saved.")
 
 # ---------------------------------------------------------------------------
-# 8. Network visualization -> hub-node summary
+# 8. Network visualization -> (a) static publication-ready PDF, (b) hub-node summary
 # ---------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(11, 11))
+gene_nodes_static = [n for n in G.nodes() if G.nodes[n]['node_type'] == 0]
+metabo_nodes_static = [n for n in G.nodes() if G.nodes[n]['node_type'] == 1]
+sample_nodes_static = [n for n in G.nodes() if G.nodes[n]['node_type'] == 2]
+nx.draw_networkx_edges(G, pos, alpha=0.15, width=0.5, edge_color='#999999', ax=ax)
+nx.draw_networkx_nodes(G, pos, nodelist=gene_nodes_static, node_shape='^', node_size=40,
+                        node_color=OMIC1_COLOR, edgecolors='black', linewidths=0.3, ax=ax)
+nx.draw_networkx_nodes(G, pos, nodelist=metabo_nodes_static, node_shape='s', node_size=40,
+                        node_color=OMIC2_COLOR, edgecolors='black', linewidths=0.3, ax=ax)
+sample_colors_static = [
+    CONDITION_COLORS[str(metadata.loc[metadata.ID == G.nodes[n]['label'], 'CONDITION'].values[0])]
+    for n in sample_nodes_static
+]
+nx.draw_networkx_nodes(G, pos, nodelist=sample_nodes_static, node_shape='o', node_size=35,
+                        node_color=sample_colors_static, edgecolors='black', linewidths=0.3, ax=ax)
+ax.set_title(f'Top-Feature Attention Network ({G.number_of_nodes()} nodes, {G.number_of_edges()} edges)')
+legend_handles = [
+    Line2D([0], [0], marker='^', color='w', markerfacecolor=OMIC1_COLOR, markeredgecolor='black', markersize=9, label='Gene'),
+    Line2D([0], [0], marker='s', color='w', markerfacecolor=OMIC2_COLOR, markeredgecolor='black', markersize=8, label='Metabolite'),
+]
+legend_handles += [
+    Line2D([0], [0], marker='o', color='w', markerfacecolor=c, markeredgecolor='black', markersize=8, label=f'Sample: {cond}')
+    for cond, c in CONDITION_COLORS.items()
+]
+ax.legend(handles=legend_handles, loc='upper left', fontsize=8, bbox_to_anchor=(1.0, 1.0))
+ax.axis('off')
+plt.tight_layout()
+plt.savefig(supplementary_dir + "network_static_publication.pdf", bbox_inches='tight', dpi=300)
+plt.close(fig)
+
 degree_series = pd.Series(dict(G.degree()))
 top_hubs = degree_series.sort_values(ascending=False).head(20)
 hub_types = [G.nodes[n]['node_type'] for n in top_hubs.index]
@@ -2722,7 +2627,7 @@ ax.legend(handles=[Patch(facecolor=OMIC1_COLOR, label='Gene'), Patch(facecolor=O
 plt.tight_layout()
 plt.savefig(supplementary_dir + "network_hub_nodes.pdf")
 plt.close(fig)
-print("Supplementary: hub-node figure saved.")
+print("Supplementary: static network / hub-node figures saved.")
 
 print("=== Supplementary visualizations complete ===")
 

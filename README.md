@@ -125,9 +125,17 @@ Everything is written under `--result_dir`, organized into subfolders:
 - `Interpretability_nodes_attention_figure.pdf` — top attended genes/metabolites
 - `embeddings_evaluations_figure.pdf` — embedding quality diagnostics
 - `network_interactive.html` — interactive, browsable version of the integrated graph
-- `leiden_clusters_composition.csv`, `leiden_cluster_network_nature_style.pdf`, `leiden_cluster_subgraphs.pdf`, `leiden_program_activity_scores.csv`, `leiden_program_activity_report.pdf` — feature "programs" found by Leiden clustering of the attention subgraph. These only appear if at least one cluster meets `--leiden_min_cluster_size`; on very small graphs it's normal for no cluster to form.
+- `leiden_clusters_composition.csv`, `leiden_cluster_network.pdf`, `leiden_cluster_subgraphs.pdf`, `leiden_program_activity_scores.csv`, `leiden_program_activity_report.pdf` — feature "programs" found by Leiden clustering of the attention subgraph. These only appear if at least one cluster meets `--leiden_min_cluster_size`; on very small graphs it's normal for no cluster to form.
 
-**Supplementary plots (`supplementary/`):** learning-rate schedule, loss-component share over time, ROC curves, per-class performance, attention concentration/distribution by omic layer, embedding separability (silhouette) and PCA scree, plus static publication-style and hub-node network figures.
+**Supplementary plots (`supplementary/`):** learning-rate schedule, loss-component share over time, ROC curves, per-class performance, attention concentration/distribution by omic layer, embedding separability (silhouette) and PCA scree, plus a hub-node network figure.
+
+### About `leiden_cluster_network.pdf`
+
+**Input:** the *contracted* program graph — one node per Leiden-derived multi-omic program (a cluster of co-attended genes/metabolites), sized by how many features it contains, with edges weighted by the total attention linking one program's members to another's (the exact same numbers also sit in `leiden_clusters_composition.csv` and `supplementary/program_connectivity_heatmap.pdf`).
+
+**Goal:** give a quick, at-a-glance map of how many distinct multi-omic programs were found, their relative sizes, and how strongly they relate to one another — a map of *programs*, not of individual features (that's what `leiden_cluster_subgraphs.pdf` is for).
+
+> ⚠️ **Please look carefully at this figure before relying on it.** Network layouts in Python (Kamada-Kawai/spring-based, as used here) are quite sensitive to the degree and weight distribution of the underlying graph — a small number of programs with widely varying connection strengths can legitimately produce a layout with a few long, stretched-out edges even when the underlying attention data is perfectly valid. If the plot ever looks off to you, please don't take it at face value: cross-check it against the underlying numbers yourself, namely `leiden_clusters_composition.csv` (which features are in which program) and `supplementary/program_connectivity_heatmap.pdf` (the exact attention weight between every pair of programs, as a matrix — no 2D layout involved). We're continuing to look for a better default here, so feedback on this specific plot is very welcome.
 
 ---
 
