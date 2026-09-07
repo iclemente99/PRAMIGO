@@ -3,3 +3,5 @@ results/
 data/simulated_toy_result/
 .pytest_cache/
 hgt_env/
+src/biomix_hgt_old.py
+src/__pycache__
