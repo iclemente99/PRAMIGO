@@ -1,7 +1,7 @@
 # PRAMIGO: A Heterogeneous Graph Transformer approach to target multi-omic integrated programs
 
 <p align="center">
-  <img src="docs/pramigopy.png" width="900">
+  <img src="docs/20260909_pramigo.png" width="900">
 </p>
 
 PRAMIGO builds a heterogeneous graph over **samples and an arbitrary number of omic layers**, trains a Heterogeneous Graph Transformer (HGT) on it, and returns embeddings, attention-based interpretability, and cluster-level "programs" of co-regulated features — all from a single command.
