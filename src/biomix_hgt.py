@@ -23,9 +23,11 @@ from torch import nn, optim
 from torch.nn import functional as F
 
 from reduction_leaky import reduction
-from utils import debuginfoStr, build_data, build_graph
-from sub_sample import sub_sample
+from utils import debuginfoStr, build_data_generic, build_graph_generic, relation_name
+from sub_sample import sub_sample_generic
 from pyHGT.model import GNN, GNN_from_raw
+from omics_manifest import resolve_manifest, ManifestError
+import itertools
 
 from warnings import filterwarnings
 filterwarnings("ignore")
@@ -83,10 +85,35 @@ plt.rcParams.update({
 OKABE_ITO = ["#0072B2", "#D55E00", "#009E73", "#E69F00",
              "#CC79A7", "#56B4E9", "#F0E442", "#000000"]
 
-OMIC1_COLOR = OKABE_ITO[0]   # genes / omic1 features - used consistently everywhere
-OMIC2_COLOR = OKABE_ITO[1]   # metabolites / omic2 features - used consistently everywhere
 SEQ_CMAP = "viridis"         # every continuous/sequential scale (attention, activity, distance)
 DIV_CMAP = "RdBu_r"          # every diverging/signed scale (blue=low/negative, red=high/positive)
+
+# Matplotlib marker cycle for an arbitrary number of omics (PRAMIGO's original script
+# hardcoded exactly 2: circle for genes, diamond for metabolites). Cycles if there are
+# more omics than markers - readability of a many-omic figure is a separate, real
+# concern (see design notes) that a bigger marker alphabet alone doesn't solve.
+OMIC_MARKERS = ['o', 'D', 's', '^', 'v', 'P', 'X', '*']
+# Plotly symbol cycle for the interactive network plot (network_interactive.html).
+# 'circle' is reserved for sample nodes so it's deliberately excluded here.
+OMIC_PLOTLY_SHAPES = ['triangle-up', 'square', 'diamond', 'star', 'pentagon', 'hexagon2', 'cross', 'x']
+
+
+def get_omic_palette(omic_names):
+    """Deterministic omic-name -> color mapping, generalizing the original script's
+    fixed OMIC1_COLOR/OMIC2_COLOR constants to an arbitrary number of omics. Cycles
+    through OKABE_ITO minus black (reserved for text/outlines) - the same palette
+    CONDITION_COLORS draws from, which is fine since omic identity and condition are
+    never colored in the same legend at once."""
+    palette = OKABE_ITO[:-1]
+    return {name: palette[i % len(palette)] for i, name in enumerate(omic_names)}
+
+
+def get_omic_markers(omic_names):
+    return {name: OMIC_MARKERS[i % len(OMIC_MARKERS)] for i, name in enumerate(omic_names)}
+
+
+def get_omic_plotly_shapes(omic_names):
+    return {name: OMIC_PLOTLY_SHAPES[i % len(OMIC_PLOTLY_SHAPES)] for i, name in enumerate(omic_names)}
 
 
 def hex_to_rgb_string(hex_color):
@@ -214,17 +241,36 @@ parser = argparse.ArgumentParser(description='Training GNN on gene cell graph')
 parser.add_argument('--data_path', type=str)
 parser.add_argument('--metadata_path', type=str, required=True,
                     help='Path to the TSV metadata file (must contain "ID" and "CONDITION" columns)')
-parser.add_argument('--omic1_path', type=str, required=True,
-                    help='Path to the omic1 TSV matrix (features x samples, "ID" column first)')
-parser.add_argument('--omic2_path', type=str, required=True,
-                    help='Path to the omic2 TSV matrix (features x samples, "ID" column first)')
+parser.add_argument('--omics_manifest', type=str, default=None,
+                    help='Path to a YAML/JSON manifest listing an arbitrary number of omics '
+                         '(see omics_manifest.py / README). Takes precedence over --omic1_path/--omic2_path.')
+parser.add_argument('--omic1_path', type=str, default=None,
+                    help='[legacy 2-omic mode] Path to the omic1 TSV matrix (features x samples, "ID" column '
+                         'first). Ignored if --omics_manifest is given.')
+parser.add_argument('--omic2_path', type=str, default=None,
+                    help='[legacy 2-omic mode] Path to the omic2 TSV matrix (features x samples, "ID" column '
+                         'first). Ignored if --omics_manifest is given.')
+parser.add_argument('--topology', type=str, default=None, choices=['full', 'star'],
+                    help="'full': every omic pair gets a direct feature-feature correlation graph "
+                         "(O(k^2) mask cost, richer cross-omic signal - PRAMIGO's original design). "
+                         "'star': omics only ever connect through sample nodes, never directly to each "
+                         "other (O(k) mask cost). Overrides the manifest's top-level `topology:` if both "
+                         "are given; defaults to 'full' if neither is set.")
+parser.add_argument('--sample_mode', type=str, default=None, choices=['intersection', 'union'],
+                    help="'intersection': only keep samples present in every omic (complete-case, "
+                         "PRAMIGO's original behavior). 'union': keep any sample present in at least one "
+                         "omic; a sample missing an omic's data gets no edges of that omic's relation type "
+                         "(see README). Overrides the manifest's top-level `sample_mode:` if both are "
+                         "given; defaults to 'intersection' if neither is set.")
 parser.add_argument('--epoch', type=int, default=100)
 # sampling times
 parser.add_argument('--n_batch', type=int, default=25,
                     help='Number of batch (sampled graphs) for each epoch')
 
-parser.add_argument('--omic1_rate', type=float, default=1)
-parser.add_argument('--omic2_rate', type=float, default=1)
+parser.add_argument('--omic1_rate', type=float, default=1,
+                    help='[legacy 2-omic mode] Use `rate:` in --omics_manifest instead when using the manifest.')
+parser.add_argument('--omic2_rate', type=float, default=1,
+                    help='[legacy 2-omic mode] Use `rate:` in --omics_manifest instead when using the manifest.')
 
 # Result
 parser.add_argument('--data_name', type=str,
@@ -236,9 +282,11 @@ parser.add_argument('--reduction', type=str, default='AE',
 parser.add_argument('--in_dim', type=int, default=256,
                     help='Number of hidden dimension (AE)')
 parser.add_argument('--omic1_corr_cutoff', type=float, default=0.7,
-                    help='Correlation cutoff threshold (0-1) for omic1 feature-feature graph edges')
+                    help='[legacy 2-omic mode] Correlation cutoff threshold (0-1) for omic1 feature-feature '
+                         'graph edges. Use `corr_cutoff:` in --omics_manifest instead when using the manifest.')
 parser.add_argument('--omic2_corr_cutoff', type=float, default=0.7,
-                    help='Correlation cutoff threshold (0-1) for omic2 feature-feature graph edges')
+                    help='[legacy 2-omic mode] Correlation cutoff threshold (0-1) for omic2 feature-feature '
+                         'graph edges. Use `corr_cutoff:` in --omics_manifest instead when using the manifest.')
 parser.add_argument('--leiden_resolution', type=float, default=1.5,
                     help='Resolution parameter for Leiden clustering of the top-feature attention subgraph')
 parser.add_argument('--leiden_min_cluster_size', type=int, default=3,
@@ -284,6 +332,24 @@ parser.add_argument('--checkpoint_every', type=int, default=1,
                     help='Save a resumable training checkpoint every N epochs')
 
 args = parser.parse_args()
+
+# Resolve the arbitrary-length omics list (--omics_manifest, or the legacy
+# --omic1_path/--omic2_path pair), plus the --topology/--sample_mode flags, once,
+# up front. Everything downstream is driven by OMIC_NAMES/OMICS instead of a fixed
+# omic1/omic2 CLI surface - see omics_manifest.py for the manifest format.
+try:
+    OMICS, TOPOLOGY, SAMPLE_MODE = resolve_manifest(args)
+except ManifestError as e:
+    parser.error(str(e))
+OMIC_NAMES = [o['name'] for o in OMICS]
+OMIC_RATE = {o['name']: o['rate'] for o in OMICS}
+OMIC_CORR_CUTOFF = {o['name']: o['corr_cutoff'] for o in OMICS}
+OMIC_KIND = {o['name']: o['kind'] for o in OMICS}
+OMIC_COLORS = get_omic_palette(OMIC_NAMES)
+OMIC_MARKERS_BY_NAME = get_omic_markers(OMIC_NAMES)
+OMIC_PLOTLY_SHAPES_BY_NAME = get_omic_plotly_shapes(OMIC_NAMES)
+print(f"Omics ({len(OMIC_NAMES)}): {OMIC_NAMES} | topology={TOPOLOGY} | sample_mode={SAMPLE_MODE}")
+
 #args.metadata_path = "/home/inigo/Desktop/BiomiX_HGT/EGA/Metadata/EGAS00001001746_metadata_CLL.tsv"
 #args.omic1_path = "/home/inigo/Desktop/BiomiX_HGT/EGA_omic1.csv"
 #args.omic2_path = "/home/inigo/Desktop/BiomiX_HGT/EGA_omic2.csv"
@@ -303,9 +369,8 @@ print(f'\n{file0}') #Print hyperparametrization
 args.metadata_path
 
 #args.result_dir = 'Output_MTB' # Sets parent directory for output
-gene_dir = args.result_dir+'/gene/' # Sets directory for gene output
-sample_dir = args.result_dir+'/sample/' # Sets directory for cell output
-metabo_dir = args.result_dir+'/metabo/' # Sets directory for cell output
+omic_dirs = {name: args.result_dir + f'/{name}/' for name in OMIC_NAMES} # Sets a per-omic output directory
+sample_dir = args.result_dir+'/sample/' # Sets directory for sample output
 model_dir = args.result_dir+'/model/' # Sets directory for model output
 att_dir = args.result_dir+'/att/' # Sets directory for attention output
 loss_dir = args.result_dir+'/loss/' # Sets directory for loss output
@@ -313,9 +378,9 @@ plots_dir = args.result_dir+'/plots/' # Sets directory for loss output
 embbs_dir = args.result_dir+'/embeddings/' # Sets directory for loss output
 supplementary_dir = args.result_dir+'/supplementary/' # Optional bonus figures, kept separate from the core plots
 os.makedirs(args.result_dir, exist_ok=True)
-os.makedirs(gene_dir, exist_ok=True)
+for _omic_dir in omic_dirs.values():
+    os.makedirs(_omic_dir, exist_ok=True)
 os.makedirs(sample_dir, exist_ok=True)
-os.makedirs(metabo_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
 os.makedirs(att_dir , exist_ok=True)
 os.makedirs(loss_dir, exist_ok=True)
@@ -375,25 +440,55 @@ one_hot_labels = one_hot_encoder.fit_transform(integer_labels.reshape(-1, 1))
 #
 ################################################################
 
-omic_1_df = pd.read_csv(args.omic1_path, sep="\t")
-omic_1_df = omic_1_df.loc[:, ~omic_1_df.columns.str.contains("^Unnamed")]
-#omic_1_df = omic_1_df[['ID'] + sample_order]
-#omic_1 = np.array(omic_1_df.iloc[:,1:])  # your raw count matrix
-omic_2_df = pd.read_csv(args.omic2_path, sep="\t")
-omic_2_df = omic_2_df.loc[:, ~omic_2_df.columns.str.contains("^Unnamed")]
-#omic_2_df = omic_2_df[['ID'] + sample_order]
-#omic_2 = np.array(omic_2_df.iloc[:,1:])  # your raw count matrix
+omic_dfs = {}
+for o in OMICS:
+    df = pd.read_csv(o['path'], sep="\t")
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+    omic_dfs[o['name']] = df
 
 meta_samples = set(metadata["ID"])
-omic_1_samples = set(omic_1_df.columns[1:])  # exclude "ID" column
-omic_2_samples = set(omic_2_df.columns[1:])
-common_samples = list(meta_samples & omic_1_samples & omic_2_samples)
+omic_sample_sets = {name: set(df.columns[1:]) for name, df in omic_dfs.items()}  # exclude "ID" column
+
+if SAMPLE_MODE == 'intersection':
+    # Complete-case (PRAMIGO's original behavior): only samples present in the
+    # metadata AND every single omic survive.
+    common_samples = list(meta_samples.intersection(*omic_sample_sets.values()))
+    sample_presence = {name: {s: True for s in common_samples} for name in OMIC_NAMES}
+else:
+    # Partial-coverage: keep any sample present in the metadata AND at least one
+    # omic. A sample missing an omic's data gets that omic's feature block
+    # zero-filled below purely so every omic matrix keeps one column per
+    # common_sample - but critically, the KNN mask that turns into graph edges for
+    # that omic<->sample relation is explicitly zeroed out for that sample further
+    # down, so the *graph structure* carries the missingness (no edges of that
+    # relation type at all), not an imputed value pretending to be real data.
+    common_samples = list(meta_samples.intersection(set().union(*omic_sample_sets.values())))
+    sample_presence = {name: {s: (s in omic_sample_sets[name]) for s in common_samples} for name in OMIC_NAMES}
+    for name in OMIC_NAMES:
+        n_missing = sum(1 for present in sample_presence[name].values() if not present)
+        if n_missing:
+            print(f"[sample_mode=union] {name}: {n_missing}/{len(common_samples)} samples have no "
+                  f"data for this omic - zero-filled feature block, no '{name}<->sample' edges for them.")
+
+if len(common_samples) == 0:
+    raise SystemExit(
+        f"No samples survive metadata + omics ({OMIC_NAMES}) under --sample_mode {SAMPLE_MODE}. "
+        f"Check --sample_mode (try 'union' if your omics only partially overlap on samples) and that "
+        f"sample IDs match exactly across --metadata_path and every omic file."
+    )
+
 metadata = metadata[metadata["ID"].isin(common_samples)].reset_index(drop=True)
-omic_1_df = omic_1_df[["ID"] + common_samples]
-omic_1 = np.array(omic_1_df.iloc[:,1:])  # your raw count matrix
-omic_2_df = omic_2_df[["ID"] + common_samples]
-omic_2 = np.array(omic_2_df.iloc[:,1:])  # your raw count matrix
 metadata = metadata.set_index("ID").loc[common_samples].reset_index()
+
+omic_matrices = {}
+for name in OMIC_NAMES:
+    df = omic_dfs[name].set_index(omic_dfs[name].columns[0])
+    sub = df.reindex(columns=common_samples)
+    missing_cols = [s for s in common_samples if not sample_presence[name][s]]
+    if missing_cols:
+        sub[missing_cols] = 0.0  # neutral placeholder for a sample this omic never measured
+    omic_dfs[name] = sub.reset_index()
+    omic_matrices[name] = sub.to_numpy()
 
 # Shared across every condition-colored plot in this script (see PUBLICATION STYLE above).
 CONDITION_COLORS = get_condition_palette(metadata['CONDITION'])
@@ -403,67 +498,77 @@ label_encoder = LabelEncoder()
 integer_labels = label_encoder.fit_transform(labels)
 one_hot_encoder = OneHotEncoder(sparse=False)
 one_hot_labels = one_hot_encoder.fit_transform(integer_labels.reshape(-1, 1))
-#trans = trans[["ID"] + common_samples]
-#metabo = metabo[["ID"] + common_samples]
-#h_n = 256
-#encoded_trans,encoded2_trans, losses, losses2 = reduction(args.reduction,trans_log_normalized,device,h_n) # Autoencoder for transcriptomics
-encoded_trans, encoded2_trans, losses, losses2 = reduction(args.reduction, omic_1, device, args.ae_n_hid)
-encoded_metabo,encoded2_metabo, losses, losses2 = reduction(args.reduction, omic_2, device,args.ae_n_hid) # Autoencoder for metabolomics
-samples = np.concatenate((omic_1,omic_2),axis=0)
-encoded_samples,encoded2_samples, losses, losses2 = reduction(args.reduction,samples,device,args.ae_n_hid) # Autoencoder for samples
+
+# Per-omic autoencoder feature reduction - generalizes the original script's two
+# hand-written reduction() calls (one per omic) to a loop over however many omics
+# the manifest lists.
+encoded = {}
+for name in OMIC_NAMES:
+    enc, enc2, losses, losses2 = reduction(args.reduction, omic_matrices[name], device, args.ae_n_hid)
+    encoded[name] = enc
+
+samples_stacked = np.concatenate([omic_matrices[name] for name in OMIC_NAMES], axis=0)
+encoded_samples, encoded2_samples, losses, losses2 = reduction(args.reduction, samples_stacked, device, args.ae_n_hid) # Autoencoder for samples
 
 def normalize_embeddings(X):
     # Normalize each row (embedding vector) to zero mean, unit variance
     return (X - X.mean(axis=1, keepdims=True)) / (X.std(axis=1, keepdims=True) + 1e-8)
 
 
-# Step 1: Concatenate (N x 256 → N x 768)
-combined = torch.cat([encoded_trans, encoded_metabo, encoded2_samples], dim=0)  # Shape: (N, 768)
+# Concatenate every omic's feature embeddings and normalize jointly - the same
+# `combined` step as the original 2-omic script, generalized to however many
+# omics there are.
+combined = torch.cat([encoded[name] for name in OMIC_NAMES], dim=0)
 normalized = normalize_embeddings(combined)
+_off = 0
+for name in OMIC_NAMES:
+    n = encoded[name].shape[0]
+    encoded[name] = normalized[_off:_off + n, :]
+    _off += n
+# NOTE (preserved from original PRAMIGO): only the per-omic *feature* embeddings go
+# through this cross-omic normalization pass - `encoded2_samples` (the per-sample
+# embedding used below) is intentionally left as reduction()'s raw output, exactly
+# as in the original 2-omic biomix_hgt.py (whose analogous `encoded2_sample` slice
+# was computed but never fed back into anything downstream). Not "fixed" here,
+# since that's a training-affecting numeric behavior outside the scope of this
+# generalization.
 
-encoded_trans = normalized[0:encoded_trans.shape[0],:]
-encoded_metabo = normalized[encoded_trans.shape[0]:(encoded_trans.shape[0]+encoded_metabo.shape[0]),:]
-encoded2_sample = normalized[(encoded_trans.shape[0]+encoded_metabo.shape[0]):normalized.shape[0],:]
-
-
-pd.DataFrame(encoded_trans.detach().numpy()).to_csv(os.path.join(embbs_dir,"ae_omic1_embeddings.csv"))
-pd.DataFrame(encoded_metabo.detach().numpy()).to_csv(os.path.join(embbs_dir,"ae_omic2_embeddings.csv"))
-pd.DataFrame(encoded2_samples.detach().numpy()).to_csv(os.path.join(embbs_dir,"ae_samples_embeddings.csv"))
+for name in OMIC_NAMES:
+    pd.DataFrame(encoded[name].detach().numpy()).to_csv(os.path.join(embbs_dir, f"ae_{name}_embeddings.csv"))
+pd.DataFrame(encoded2_samples.detach().numpy()).to_csv(os.path.join(embbs_dir, "ae_samples_embeddings.csv"))
 debuginfoStr('Feature extraction finished') # Print verbose
 
 
-#def normalize_embeddings(X):
-#    # Normalize each row (embedding vector) to zero mean, unit variance
-#    return (X - X.mean(axis=1, keepdims=True)) / (X.std(axis=1, keepdims=True) + 1e-8)
-
 def compute_binary_correlation_mask(A, B, ae_n_hid, threshold=0.7):
     # Normalize embeddings for Pearson correlation
-    #A_norm = normalize_embeddings(A)
-    #B_norm = normalize_embeddings(B)
     A_norm = A
     B_norm = B
     # Pearson correlation = cosine similarity of standardized vectors
-    corr = np.dot(A_norm, B_norm.T) / ae_n_hid  # 256 is the dimension
-    return (corr >= threshold).astype(np.uint8)  # Binary mask: 1 if corr >= 0.7
+    corr = np.dot(A_norm, B_norm.T) / ae_n_hid  # ae_n_hid is the embedding dimension
+    return (corr >= threshold).astype(np.uint8)  # Binary mask: 1 if corr >= threshold
 
 
-# A, B, C are numpy arrays of shape (N1, 256), (N2, 256), and (N3, 256)
-# binary masks for each pair
-mask_trans = compute_binary_correlation_mask(encoded_trans.detach().numpy(), encoded_trans.detach().numpy(), args.ae_n_hid, threshold=args.omic1_corr_cutoff)
-np.fill_diagonal(mask_trans, 0)
-mask_metabo = compute_binary_correlation_mask(encoded_metabo.detach().numpy(), encoded_metabo.detach().numpy(),args.ae_n_hid, threshold=args.omic2_corr_cutoff)
-np.fill_diagonal(mask_metabo, 0)
-mask_sample = np.zeros([encoded2_samples.shape[0],encoded2_samples.shape[0]])
+# Each omic's own feature-feature correlation graph (self_masks[name]).
+self_masks = {}
+for name in OMIC_NAMES:
+    m = compute_binary_correlation_mask(encoded[name].detach().numpy(), encoded[name].detach().numpy(),
+                                         args.ae_n_hid, threshold=OMIC_CORR_CUTOFF[name])
+    np.fill_diagonal(m, 0)
+    self_masks[name] = m
+
+# Sample-sample edges: kept as an all-zero placeholder relation, exactly like the
+# original 2-omic script (no direct sample-sample correlation is computed here).
+sample_mask = np.zeros([encoded2_samples.shape[0], encoded2_samples.shape[0]])
 
 # NO MULTIOMIC CORRELATIONS - SEPARATE AEs ARTIFACTS
 from sklearn.neighbors import NearestNeighbors
-import numpy as np
 
 def compute_knn_mask(A, B, k=100, metric='cosine'):
     """
     For each row in A, find k nearest neighbors in B.
     Returns a binary matrix of shape (A.shape[0], B.shape[0]).
     """
+    k = max(1, min(k, B.shape[0]))
     neigh = NearestNeighbors(n_neighbors=k, metric=metric)
     neigh.fit(B)
     dists, indices = neigh.kneighbors(A)
@@ -472,15 +577,36 @@ def compute_knn_mask(A, B, k=100, metric='cosine'):
         mask[i, neighbors] = 1
     return mask
 
-# k = 100 nearest neighbors
-mask_trans_metabo = compute_knn_mask(encoded_trans.detach().numpy(), encoded_metabo.detach().numpy(), k=round(encoded_metabo.shape[0]/3))
-mask_trans_sample = compute_knn_mask(encoded_trans.detach().numpy(), encoded2_samples.detach().numpy(), k=round(encoded2_samples.shape[0]/3))
-mask_metabo_samples = compute_knn_mask(encoded_metabo.detach().numpy(), encoded2_samples.detach().numpy(), k=round(encoded2_samples.shape[0]/3))
-np.fill_diagonal(mask_trans_metabo, 0)
-np.fill_diagonal(mask_trans_sample, 0)
-np.fill_diagonal(mask_metabo_samples, 0)
+# omic <-> sample edges: always computed, regardless of --topology.
+cross_sample_masks = {}
+for name in OMIC_NAMES:
+    m = compute_knn_mask(encoded[name].detach().numpy(), encoded2_samples.detach().numpy(),
+                          k=round(encoded2_samples.shape[0] / 3))
+    np.fill_diagonal(m, 0)
+    if SAMPLE_MODE == 'union':
+        missing_col_idx = [i for i, s in enumerate(common_samples) if not sample_presence[name][s]]
+        if missing_col_idx:
+            m[:, missing_col_idx] = 0  # no imputed edges for samples this omic never measured
+    cross_sample_masks[name] = m
 
-print(f'genes connect: {np.sum(mask_trans)}, metabo connect: {np.sum(mask_metabo)}, samples connect: {np.sum(mask_sample)}, genes-metabo connect: {np.sum(mask_trans_metabo)}, genes-samples connect: {np.sum(mask_trans_sample)}, mask_metabo_samples: {np.sum(mask_metabo_samples)}')
+# omic <-> omic edges: only under --topology full (every pair gets a direct
+# feature-feature KNN graph - O(k^2) mask cost, richer cross-omic signal); stays
+# empty under --topology star (omics only ever connect through sample nodes -
+# O(k) cost, no omic-omic pair is ever computed at all). See README.
+cross_omic_masks = {}
+if TOPOLOGY == 'full':
+    for a, b in itertools.combinations(OMIC_NAMES, 2):
+        m = compute_knn_mask(encoded[a].detach().numpy(), encoded[b].detach().numpy(),
+                              k=round(encoded[b].shape[0] / 3))
+        np.fill_diagonal(m, 0)
+        cross_omic_masks[(a, b)] = m
+
+_summary = ", ".join(f"{name} self-connect: {int(np.sum(self_masks[name]))}" for name in OMIC_NAMES)
+_summary += f", samples self-connect: {int(np.sum(sample_mask))}"
+_summary += ", " + ", ".join(f"{name}-samples connect: {int(np.sum(cross_sample_masks[name]))}" for name in OMIC_NAMES)
+if cross_omic_masks:
+    _summary += ", " + ", ".join(f"{a}-{b} connect: {int(np.sum(m))}" for (a, b), m in cross_omic_masks.items())
+print(_summary)
 
 
 
@@ -490,7 +616,10 @@ print(f'genes connect: {np.sum(mask_trans)}, metabo connect: {np.sum(mask_metabo
 #
 ################################################################
 
-graph = build_graph(mask_trans_metabo,mask_trans_sample,mask_metabo_samples,mask_trans,mask_metabo,mask_sample, encoded_trans,encoded_metabo,encoded2_samples) # Generate graph based in autoencoder and KNN matrix
+node_features_for_graph = {name: encoded[name].detach().numpy() for name in OMIC_NAMES}
+node_features_for_graph['sample'] = encoded2_samples.detach().numpy()
+graph = build_graph_generic(node_features_for_graph, cross_sample_masks, self_masks, sample_mask,
+                             cross_omic_masks, OMIC_NAMES) # Generate graph based in autoencoder and KNN matrix
 debuginfoStr('Build Graph finished') # Print verbose
 
 
@@ -505,30 +634,22 @@ debuginfoStr('Build Graph finished') # Print verbose
 print("Start sampling!")
 np.random.seed(seed)
 jobs = []
-#args.gene_rate= 1
-#args.metabo_rate = 1
-#args.sample_rate=1
-#sample_num=int((encoded2_samples.shape[0]*args.sample_rate)/args.n_batch) # Sets the number of cells in subgraph
 sample_num=round(encoded2_samples.shape[0]/3)
-gene_num=int((encoded_trans.shape[0]*args.omic1_rate)/args.n_batch) # Sets the number of TFs in subrgraph
-metabo_num=int((encoded_metabo.shape[0]*args.omic2_rate)/args.n_batch) # Sets the number of TFs in subrgraph
-print(f'sample_num: {sample_num}, gene_num: {gene_num}, metabo_num: {metabo_num}')
+omic_sizes = {name: max(1, int((encoded[name].shape[0]*OMIC_RATE[name])/args.n_batch)) for name in OMIC_NAMES} # Sets the number of features per omic in subgraph
+print(f'sample_num: {sample_num}, omic_sizes: {omic_sizes}')
 for _ in range(args.n_batch): # Iterates over subsampling
-    p = sub_sample(graph,
-                    mask_trans_sample,
-                    mask_metabo_samples,
-                    mask_trans_metabo,
-                    mask_trans,
-                    mask_metabo,
-                    mask_sample,
-                    sample_num,
-                    gene_num,
-                    metabo_num,
-                    encoded_trans.shape[0],
-                    encoded_metabo.shape[0],
-                    encoded2_samples.shape[0]) # Sub-graphs sampling as jobs to learn from in HGT
+    p = sub_sample_generic(graph,
+                            cross_sample_masks,
+                            self_masks,
+                            sample_mask,
+                            cross_omic_masks,
+                            OMIC_NAMES,
+                            sample_num,
+                            omic_sizes,
+                            encoded2_samples.shape[0],
+                            topology=TOPOLOGY) # Sub-graphs sampling as jobs to learn from in HGT
     jobs.append(p)
-    
+
 
 print("Sampling end!")
 debuginfoStr('Cell Graph constructed and pruned')
@@ -572,14 +693,16 @@ print(f"Train jobs: {len(train_jobs)}, Val jobs: {len(val_jobs)}, Test jobs: {le
 ################################################################
 #args.n_heads = 8
 #args.n_hid = 128  # Ensure divisibility
-# num_types/num_relations are derived from the graph itself (3 node types: gene,
-# metabolite, sample; 6 relation types + 1 reserved "self" slot) instead of being
-# hardcoded, so they stay correct if the graph construction ever changes.
+# num_types/num_relations are derived from the graph itself (N omic node types + 1
+# sample type; however many relation types the masks above actually produced, + 1
+# reserved "self" slot) instead of being hand-computed and pasted in as literals -
+# this is what lets the exact same code run for 2 omics or 15.
 num_types = len(graph.get_types())
 num_relations = len(graph.get_meta_graph()) + 1  # +1 for the reserved 'self' relation
 gnn = GNN(conv_name=args.layer_type, in_dim=args.ae_n_hid,
                 n_hid=args.n_hid, n_heads=args.n_heads, n_layers=args.n_layers, dropout=args.dropout,
-                num_types=num_types, num_relations=num_relations, use_RTE=False, n_labels=one_hot_labels.shape[1]
+                num_types=num_types, num_relations=num_relations, use_RTE=False, n_labels=one_hot_labels.shape[1],
+                sample_type_id=len(OMIC_NAMES)  # 'sample' is inserted last into graph.node_feature - see build_graph_generic()
                 ).to(device) # Loads HGT function
 #gnn = GNN_class(conv_name=args.layer_type, in_dim=256,
 #                n_hid=args.n_hid, n_heads=args.n_heads, n_layers=args.n_layers, dropout=args.dropout,
@@ -612,8 +735,7 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 start = timer()
 gnn.train() # The GNN arquitecture. It shows the layers and dimensions.
 training_loss = []
-kl_gene_losses = []
-kl_metabo_losses = []
+kl_losses_history = {name: [] for name in OMIC_NAMES}
 cross_entropy_losses = []
 cosine_losses = []
 total_losses = []
@@ -652,8 +774,7 @@ if args.resume:
         val_losses = checkpoint.get('val_losses', [])
         cosine_losses = checkpoint.get('cosine_losses', [])
         cross_entropy_losses = checkpoint.get('cross_entropy_losses', [])
-        kl_gene_losses = checkpoint.get('kl_gene_losses', [])
-        kl_metabo_losses = checkpoint.get('kl_metabo_losses', [])
+        kl_losses_history = checkpoint.get('kl_losses_history', {name: [] for name in OMIC_NAMES})
         lr_history = checkpoint.get('lr_history', [])
         random.setstate(checkpoint['random_state'])
         np.random.set_state(checkpoint['numpy_random_state'])
@@ -680,8 +801,7 @@ def save_checkpoint(current_epoch):
         'val_losses': val_losses,
         'cosine_losses': cosine_losses,
         'cross_entropy_losses': cross_entropy_losses,
-        'kl_gene_losses': kl_gene_losses,
-        'kl_metabo_losses': kl_metabo_losses,
+        'kl_losses_history': kl_losses_history,
         'lr_history': lr_history,
         'random_state': random.getstate(),
         'numpy_random_state': np.random.get_state(),
@@ -735,8 +855,7 @@ for epoch in np.arange(start_epoch, args.epoch): # Iterates over the epochs. Num
                         
                     
                 
-        node_feature_tensor = torch.cat((node_feature[0],node_feature[1]),0) # Nodes features matrix in tensor format
-        node_feature = torch.cat((node_feature_tensor, node_feature[2]),0)
+        node_feature = torch.cat(node_feature, 0) # Nodes features matrix in tensor format (N omics + samples, in type-index order)
         node_type = torch.LongTensor(node_type) # Nodes type matrix in tensor format
         edge_time = torch.LongTensor(edge_time) # Edges time matrix in tensor format (all the same)
         edge_index = torch.LongTensor(edge_index).t() # Edges indexes (nodes-nodes connections) in tensor format
@@ -757,26 +876,25 @@ for epoch in np.arange(start_epoch, args.epoch): # Iterates over the epochs. Num
                 #       print("t_i="+str(t_i))
                 #        node_decoded_embedding[t_i] = torch.trunc(
                 #            node_decoded_embedding[t_i]*10000000000)/10000000000
-        gene_matrix = node_rep[node_type == 0, ] # Extracts gene nodes representations
-        metabo_matrix = node_rep[node_type == 1, ] # Extracts cells nodes representations
-        sample_matrix = node_rep[node_type == 2, ]
+        omic_reps = {name: node_rep[node_type == i, ] for i, name in enumerate(OMIC_NAMES)} # Extracts each omic's node representations
+        sample_matrix = node_rep[node_type == len(OMIC_NAMES), ]
         regularization_loss = 0 # Initialization of regularization loss
         for param in gnn.parameters():
             regularization_loss += torch.sum(torch.pow(param, 2)) # Saves the regularization loss over parameters
                 
         if (args.loss == "sup"): # No other option
-            #decoder = torch.mm(gene_matrix, cell_matrix.t())
-            #decoder_2 = torch.mm(cell_matrix, gene_matrix.t())
-            decoder_g = torch.mm(sample_matrix, gene_matrix.t())
-            decoder_m = torch.mm(sample_matrix, metabo_matrix.t())
-            adj = samples.T[indxs['sample'], ] # Extracts genes indeces
-            indexes = np.concatenate([indxs['gene'],indxs['metabolite']+encoded_trans.shape[0]])
-            adj_g = adj[:, indxs['gene']]
-            adj_m = adj[:, indxs['metabolite']+encoded_trans.shape[0]] # metabolite columns are offset past the gene columns in `adj`
-            adj = adj[:, indexes] # Extracts cells indeces
+            decoders = {name: torch.mm(sample_matrix, omic_reps[name].t()) for name in OMIC_NAMES}
+            adj = samples_stacked.T[indxs['sample'], ] # Extracts every omic's feature columns for the sampled samples
+            omic_offsets = {}
+            _off = 0
+            for name in OMIC_NAMES:
+                omic_offsets[name] = _off
+                _off += encoded[name].shape[0]
+            indexes = np.concatenate([indxs[name] + omic_offsets[name] for name in OMIC_NAMES])
+            adj_per_omic = {name: torch.tensor(adj[:, indxs[name] + omic_offsets[name]], dtype=torch.float32).to(device)
+                            for name in OMIC_NAMES} # per-omic columns are offset past every earlier omic's columns in `adj`
+            adj = adj[:, indexes] # Extracts every sampled omic feature's column, in omic order
             adj = torch.tensor(adj, dtype=torch.float32).to(device) # Sets an adjacency matrix
-            adj_g = torch.tensor(adj_g, dtype=torch.float32).to(device)
-            adj_m = torch.tensor(adj_m, dtype=torch.float32).to(device)
             samples_labels = one_hot_labels[indxs['sample'], ]
             #samples_labels = one_hot_labels[node_type == 2, ]
             #cells_labels = patient_loss[indxs['cell'],:]
@@ -796,8 +914,8 @@ for epoch in np.arange(start_epoch, args.epoch): # Iterates over the epochs. Num
                 #loss = F.kl_div(decoder_g.softmax(dim=-1).log(), adj_g.softmax(dim=-1), reduction='sum')
                 #loss += F.kl_div(decoder_m.softmax(dim=-1).log(),adj_m.softmax(dim=-1), reduction='sum') # Calculates loss function based in KL divergence
                 #loss += F.cross_entropy(class_rep.softmax(dim=-1),torch.FloatTensor(samples_labels).to(device))
-                kl_gene = F.kl_div(decoder_g.softmax(dim=-1).log(), adj_g.softmax(dim=-1), reduction='sum')
-                kl_metabo = F.kl_div(decoder_m.softmax(dim=-1).log(), adj_m.softmax(dim=-1), reduction='sum')
+                kl_losses = {name: F.kl_div(decoders[name].softmax(dim=-1).log(), adj_per_omic[name].softmax(dim=-1), reduction='sum')
+                             for name in OMIC_NAMES}
                 ce_loss = F.cross_entropy(class_rep,torch.FloatTensor(samples_labels).to(device))
                 #loss = 0.2*kl_gene + 0.2*kl_metabo + 0.6*ce_loss
                 #loss = kl_gene + kl_metabo + ce_loss
@@ -892,8 +1010,7 @@ for epoch in np.arange(start_epoch, args.epoch): # Iterates over the epochs. Num
                             edge_type += [edge_dict[relation_type]]
                             edge_time += [120]
                             
-            node_feature_tensor = torch.cat((node_feature[0], node_feature[1]), 0)
-            node_feature = torch.cat((node_feature_tensor, node_feature[2]), 0)
+            node_feature = torch.cat(node_feature, 0) # Nodes features matrix in tensor format (N omics + samples, in type-index order)
             node_type = torch.LongTensor(node_type).to(device)
             edge_time = torch.LongTensor(edge_time).to(device)
             edge_index = torch.LongTensor(edge_index).t().to(device)
@@ -901,23 +1018,25 @@ for epoch in np.arange(start_epoch, args.epoch): # Iterates over the epochs. Num
             node_rep, class_rep, g_32, g_64, g_128 = gnn.forward(
                 node_feature, node_type, edge_time, edge_index, edge_type
             )
-            gene_matrix = node_rep[node_type == 0, :]
-            metabo_matrix = node_rep[node_type == 1, :]
-            sample_matrix = node_rep[node_type == 2, :]
+            omic_reps = {name: node_rep[node_type == i, :] for i, name in enumerate(OMIC_NAMES)}
+            sample_matrix = node_rep[node_type == len(OMIC_NAMES), :]
             regularization_loss = 0
             for param in gnn.parameters():
                 regularization_loss += torch.sum(torch.pow(param, 2))
                 
             if args.loss == "sup":
-                decoder_g = torch.mm(sample_matrix, gene_matrix.t())
-                decoder_m = torch.mm(sample_matrix, metabo_matrix.t())
-                adj = samples.T[indxs['sample'], :]
-                indexes = np.concatenate([indxs['gene'], indxs['metabolite'] + encoded_trans.shape[0]])
-                adj_g = adj[:, indxs['gene']]
-                adj_m = adj[:, indxs['metabolite'] + encoded_trans.shape[0]] # metabolite columns are offset past the gene columns in `adj`
+                decoders = {name: torch.mm(sample_matrix, omic_reps[name].t()) for name in OMIC_NAMES}
+                adj = samples_stacked.T[indxs['sample'], :] # Extracts every omic's feature columns for the sampled samples
+                omic_offsets = {}
+                _off = 0
+                for name in OMIC_NAMES:
+                    omic_offsets[name] = _off
+                    _off += encoded[name].shape[0]
+                indexes = np.concatenate([indxs[name] + omic_offsets[name] for name in OMIC_NAMES])
+                adj_per_omic = {name: torch.tensor(adj[:, indxs[name] + omic_offsets[name]], dtype=torch.float32).to(device)
+                                for name in OMIC_NAMES} # per-omic columns are offset past every earlier omic's columns in `adj`
+                adj = adj[:, indexes] # Extracts every sampled omic feature's column, in omic order
                 adj = torch.tensor(adj, dtype=torch.float32).to(device)
-                adj_g = torch.tensor(adj_g, dtype=torch.float32).to(device)
-                adj_m = torch.tensor(adj_m, dtype=torch.float32).to(device)
                 samples_labels = one_hot_labels[indxs['sample'], :]
                 if args.reduction == 'raw':
                     if epoch % 2 == 0:
@@ -927,8 +1046,8 @@ for epoch in np.arange(start_epoch, args.epoch): # Iterates over the epochs. Num
                         for t_i in range(1, len(types)):
                             val_loss += nn.MSELoss()(node_feature[t_i], node_decoded_embedding[t_i])
                 else:
-                    kl_gene = F.kl_div(decoder_g.softmax(dim=-1).log(), adj_g.softmax(dim=-1), reduction='sum')
-                    kl_metabo = F.kl_div(decoder_m.softmax(dim=-1).log(), adj_m.softmax(dim=-1), reduction='sum')
+                    kl_losses = {name: F.kl_div(decoders[name].softmax(dim=-1).log(), adj_per_omic[name].softmax(dim=-1), reduction='sum')
+                                 for name in OMIC_NAMES}
                     ce_loss = F.cross_entropy(class_rep, torch.FloatTensor(samples_labels).to(device))
                     num_samples = sample_matrix.shape[0]
                     max_pairs = 1000
@@ -976,8 +1095,8 @@ for epoch in np.arange(start_epoch, args.epoch): # Iterates over the epochs. Num
     printed_train_loss = L/(int(len(train_jobs)))
     print(f'Epoch: {epoch+1} | Train Loss: {printed_train_loss:.12f}\nEpoch: {epoch+1} | Val Loss: {printed_val_loss:.12f}')
     #training_loss.append((L/(int(samples.shape[0]))/args.n_batch))
-    kl_gene_losses.append(kl_gene.item())
-    kl_metabo_losses.append(kl_metabo.item())
+    for name in OMIC_NAMES:
+        kl_losses_history[name].append(kl_losses[name].item())
     cross_entropy_losses.append(ce_loss.item())
     cosine_losses.append(cosine_loss.item())  # Track cosine loss
     total_losses.append(loss.item())
@@ -1067,7 +1186,7 @@ gnn.load_state_dict(state['model'])
 gnn.eval()
 
 # Determine batch size
-sample_len = samples.T.shape[0]
+sample_len = samples_stacked.T.shape[0]
 if sample_len > 10000:
     ba = 500
 else:
@@ -1087,8 +1206,7 @@ else:
 #            ba = gene_cell.shape[0] # Adapts batch to data dimensions
 
 sample_embedding = []
-gene_embedding = []
-metabo_embedding = []
+omic_embedding = {name: [] for name in OMIC_NAMES}
 attention = []
 saliency = []
 g32_embeddings = []
@@ -1096,60 +1214,42 @@ g64_embeddings = []
 g128_embeddings = []
 class_embeddings = []
 
+node_features_full = {name: encoded[name].detach().numpy() for name in OMIC_NAMES}
+
 #with torch.no_grad():
 #with gnn.eval():
 for i in range(0, sample_len, ba):
         # Sub-batch slice
-    sample_batch = samples.T[i:i+ba]
-        # Plotting
-        #encoded_sample_batch = encoded2_samples[i:i+ba]
-        
-        # Recompute masks for the batch
-        #mask_trans_sample_batch = compute_knn_mask(encoded_trans.cpu().numpy(), encoded_sample_batch.cpu().numpy(), k=100)
-        #mask_metabo_samples_batch = compute_knn_mask(encoded_metabo.cpu().numpy(), encoded_sample_batch.cpu().numpy(), k=100)
-        
-        # Build full graph from fixed gene/metabo, and batch of samples
-        #graph = build_graph(
-        #    mask_trans_metabo=mask_trans_metabo,
-        #    mask_trans_sample=mask_trans_sample[:,i:i+ba],
-        #    mask_metabo_samples=mask_metabo_samples[:,i:i+ba],
-        #    mask_trans=mask_trans,
-        #    mask_metabo=mask_metabo,
-        #    mask_sample=mask_sample[i:i+ba, i:i+ba],  # sub-mask for current batch
-        #    encoded_trans=encoded_trans,
-        #    encoded_metabo=encoded_metabo,
-        #    encoded2_samples=encoded2_samples[i:i+ba,:]
-        #)
-        
-    x,node_type, edge_time, edge_index,edge_type = build_data(
-        mask_trans_metabo=mask_trans_metabo,
-        mask_trans_sample=mask_trans_sample[:,i:i+ba],
-        mask_metabo_samples=mask_metabo_samples[:,i:i+ba],
-        mask_trans=mask_trans,
-        mask_metabo=mask_metabo,
-        mask_sample=mask_sample[i:i+ba, i:i+ba],  # sub-mask for current batch
-        encoded_trans=encoded_trans,
-        encoded_metabo=encoded_metabo,
-        encoded2_samples=encoded2_samples[i:i+ba,:],
-        edge_dict= edge_dict
+    sample_batch = samples_stacked.T[i:i+ba]
+
+        # Build (x, node_type, edge_time, edge_index, edge_type) for the fixed omic
+        # feature nodes plus this batch of sample nodes - the N-omic generalization
+        # of the original per-omic build_graph()/build_data() calls.
+    batch_node_features = dict(node_features_full)
+    batch_node_features['sample'] = encoded2_samples[i:i+ba, :].detach().numpy()
+    batch_cross_sample_masks = {name: cross_sample_masks[name][:, i:i+ba] for name in OMIC_NAMES}
+    batch_sample_mask = sample_mask[i:i+ba, i:i+ba]  # sub-mask for current batch
+
+    x, node_type, edge_time, edge_index, edge_type = build_data_generic(
+        batch_node_features,
+        batch_cross_sample_masks,
+        self_masks,
+        batch_sample_mask,
+        cross_omic_masks,
+        OMIC_NAMES,
+        edge_dict
     )
-    
-    gnn.eval() 
-    x_tensor = torch.cat((x['gene'],x['metabolite']),0) # Nodes features matrix in tensor format
-    x = torch.cat((x_tensor, x['sample']),0)
+
+    gnn.eval()
+    x = torch.cat([x[name] for name in OMIC_NAMES] + [x['sample']], 0) # Nodes features matrix in tensor format
     x.requires_grad = True
-    node_type = torch.LongTensor(node_type) # Nodes type matrix in tensor format
-    node_rep, class_rep, g_32, g_64, g_128 = gnn.forward(x, 
-                                    node_type.to(device),edge_time.to(device), 
+    node_rep, class_rep, g_32, g_64, g_128 = gnn.forward(x,
+                                    node_type.to(device),edge_time.to(device),
                                     edge_index.to(device), edge_type.to(device)) # Applies HGT
-    #gene_name = gene_name + list(np.array(edge_index[0]+i)) # Saves gene results
-    #cell_name = cell_name + list(np.array(edge_index[1]-adj.shape[0])) # Saves cells results
     attention.append(gnn.att.detach().numpy()) # Saves attention
-    gene_matrix = node_rep[node_type == 0, ] # Extracts gene nodes representations
-    metabo_matrix = node_rep[node_type == 1, ] # Extracts cells nodes representations
-    sample_matrix = node_rep[node_type == 2, ]
-    gene_embedding.append(gene_matrix.detach().numpy())
-    metabo_embedding.append(metabo_matrix.detach().numpy())
+    for _idx, _name in enumerate(OMIC_NAMES):
+        omic_embedding[_name].append(node_rep[node_type == _idx, ].detach().numpy()) # Extracts this omic's node representations
+    sample_matrix = node_rep[node_type == len(OMIC_NAMES), ]
     sample_embedding.append(sample_matrix.detach().numpy())
     # Choose a scalar objective for gradients
     #score = class_rep.norm()  # or class_rep.mean() or a specific class prediction
@@ -1159,7 +1259,6 @@ for i in range(0, sample_len, ba):
     # Grab gradients
     #saliency.append(x.grad.data.abs())  # [N, F] gradient magnitude
     saliency.append(x.grad.abs().cpu().numpy())
-    #s_embedding.append(gene_matrix)
     g32_embeddings.append(g_32.detach().numpy())
     g64_embeddings.append(g_64.detach().numpy())
     g128_embeddings.append(g_128.detach().numpy())
@@ -1172,8 +1271,7 @@ for i in range(0, sample_len, ba):
 # np.vstack naturally handles a final partial batch, so there is no need to special-case
 # samples.shape[1] % ba != 0 (a previous version of this branch mixed up gene/metabo/sample
 # matrices when the batch size didn't evenly divide the sample count).
-gene_matrix = np.vstack(gene_embedding)
-metabo_matrix = np.vstack(metabo_embedding)
+omic_matrix = {name: np.vstack(omic_embedding[name]) for name in OMIC_NAMES}
 sample_matrix = np.vstack(sample_embedding)
 attention = np.vstack(attention)
 saliency = np.vstack(saliency)
@@ -1184,8 +1282,8 @@ class_embeddings = np.vstack(class_embeddings)
 
 
 #cell_matrix = cell_matrix.detach().numpy()
-np.savetxt(gene_dir+file0, gene_matrix, delimiter=' ')
-np.savetxt(metabo_dir+file0, metabo_matrix, delimiter=' ')
+for name in OMIC_NAMES:
+    np.savetxt(omic_dirs[name]+file0, omic_matrix[name], delimiter=' ')
 np.savetxt(sample_dir+file0, sample_matrix, delimiter=' ')
 #np.savetxt(embeddings_dir+file0, sample_matrix, delimiter=' ')
 positions = pd.DataFrame(edge_index.T)
@@ -1316,14 +1414,16 @@ node_attention_mean = abs(saliency_filtered).mean(axis=1)
 #node_attention_mean = (node_attention_mean/node_attention_mean[node_type != 2].sum())*100
 #sample_node_attention = node_attention_mean[node_type == 2]
 #gene_node_attention = node_attention_mean[node_type == 0]
-#metabo_node_attention = pd.concat([metabo.ID.reset_index(drop=True),pd.DataFrame(node_attention_mean[node_type == 1].detach().numpy())], axis=1)
-metabo_node_attention = pd.concat([omic_2_df.ID.reset_index(drop=True),pd.DataFrame(node_attention_mean[node_type_filtered == 1])], axis=1)
-metabo_node_attention.columns = ['Omic_2_ID', 'Attention']
-#gene_node_attention = pd.concat([trans.ID[top_gene_indices].reset_index(drop=True),pd.DataFrame(node_attention_mean[node_type == 0].detach().numpy())], axis=1)
-##gene_node_attention = pd.concat([trans.Symbol[top_gene_indices].reset_index(drop=True),pd.DataFrame(node_attention_mean[node_type_filtered == 0])], axis=1)
-gene_node_attention = pd.concat([omic_1_df.ID.reset_index(drop=True),pd.DataFrame(node_attention_mean[node_type_filtered == 0])], axis=1)
-#gene_node_attention = pd.concat([trans.ID.reset_index(drop=True),pd.DataFrame(node_attention_mean[node_type_filtered == 0])], axis=1)
-gene_node_attention.columns = ['Omic_1_ID', 'Attention']
+# Per-omic Feature/Attention dataframe - generalizes the original script's two
+# hand-written gene_node_attention/metabo_node_attention frames to N omics.
+omic_node_attention = {}
+for _oi, _name in enumerate(OMIC_NAMES):
+    _df = pd.concat([
+        omic_dfs[_name]['ID'].reset_index(drop=True),
+        pd.DataFrame(node_attention_mean[node_type_filtered == _oi])
+    ], axis=1)
+    _df.columns = [f'{_name}_ID', 'Attention']
+    omic_node_attention[_name] = _df
 #sample_node_attention = pd.concat([pd.DataFrame(trans.columns[1:]),pd.DataFrame(node_attention_mean[node_type == 2].detach().numpy())], axis=1)
 #import mygene
 #mg = mygene.MyGeneInfo()
@@ -1333,15 +1433,15 @@ gene_node_attention.columns = ['Omic_1_ID', 'Attention']
 #gene_node_attention['Gene_Symbol'].fillna(gene_node_attention['Gene_ID'], inplace=True)  # fallback to ID if no match
 #from matplotlib import gridspec
 # --------------------------
-# Prepare gene + metabolite input
+# Prepare one Feature/Attention/Type dataframe per omic
 # --------------------------
-gene_df = gene_node_attention[['Omic_1_ID', 'Attention']].copy()
-gene_df['Type'] = 'Omic1_feature'
-gene_df = gene_df.rename(columns={'Omic_1_ID': 'Feature'})
-metabo_df = metabo_node_attention[['Omic_2_ID', 'Attention']].copy()
-metabo_df['Type'] = 'Omic2_feature'
-metabo_df = metabo_df.rename(columns={'Omic_2_ID': 'Feature'})
-combined = pd.concat([gene_df, metabo_df], ignore_index=True)
+omic_feature_dfs = {}
+for _name in OMIC_NAMES:
+    _df = omic_node_attention[_name][[f'{_name}_ID', 'Attention']].copy()
+    _df['Type'] = f'{_name}_feature'
+    _df = _df.rename(columns={f'{_name}_ID': 'Feature'})
+    omic_feature_dfs[_name] = _df
+combined = pd.concat(list(omic_feature_dfs.values()), ignore_index=True)
 combined = combined.sort_values('Attention', ascending=False).reset_index(drop=True)
 # --------------------------
 # Cumulative attention + saturation
@@ -1355,40 +1455,35 @@ saturation_y = combined.loc[saturation_idx, 'Cumulative_Attention_%']
 #top_features = combined.iloc[:saturation_x]
 top_features = combined.iloc[:min(combined.shape[0],300)]
 # --------------------------
-# Prepare top 100 gene & metabolite
+# Prepare top 100 features per omic
 # --------------------------
-gene_top100 = gene_df.sort_values('Attention', ascending=False).head(min(100,gene_df.shape[0]))
-metabo_top100 = metabo_df.sort_values('Attention', ascending=False).head(min(100,metabo_df.shape[0]))
-gene_total_attention = gene_df['Attention'].sum()
-metabo_total_attention = metabo_df['Attention'].sum()
+omic_top100 = {_name: _df.sort_values('Attention', ascending=False).head(min(100, _df.shape[0]))
+                for _name, _df in omic_feature_dfs.items()}
+omic_total_attention = {_name: _df['Attention'].sum() for _name, _df in omic_feature_dfs.items()}
 # --------------------------
 # Plot all into one PDF page
 # --------------------------
-fig = plt.figure(figsize=(18, 24))
-gs = gridspec.GridSpec(2, 3, height_ratios=[1, 0.6])
-# Top 100 Genes
-ax0 = fig.add_subplot(gs[0, 0])
-ax0.barh(gene_top100['Feature'], gene_top100['Attention'], color=OMIC1_COLOR)
-ax0.invert_yaxis()
-ax0.set_xlabel('Attention Score')
-ax0.set_title(f'Top 100 Omic_1 Features\nTotal: {gene_total_attention:.2f} | Mean: {gene_total_attention / len(gene_df):.5f}')
-ax0.tick_params(axis='y', labelsize=5)
-# Top 100 Metabolites
-ax1 = fig.add_subplot(gs[0, 1])
-ax1.barh(metabo_top100['Feature'], metabo_top100['Attention'], color=OMIC2_COLOR)
-ax1.invert_yaxis()
-ax1.set_xlabel('Attention Score')
-ax1.set_title(f'Top 100 Omic_2 Features\nTotal: {metabo_total_attention:.2f} | Mean: {metabo_total_attention / len(metabo_df):.5f}')
-ax1.tick_params(axis='y', labelsize=5)
+fig = plt.figure(figsize=(6 * (len(OMIC_NAMES) + 1), 24))
+gs = gridspec.GridSpec(2, len(OMIC_NAMES) + 1, height_ratios=[1, 0.6])
+# Top 100 features, one panel per omic
+for _oi, _name in enumerate(OMIC_NAMES):
+    _ax = fig.add_subplot(gs[0, _oi])
+    _ax.barh(omic_top100[_name]['Feature'], omic_top100[_name]['Attention'], color=OMIC_COLORS[_name])
+    _ax.invert_yaxis()
+    _ax.set_xlabel('Attention Score')
+    _ax.set_title(f'Top 100 {_name} Features\nTotal: {omic_total_attention[_name]:.2f} | '
+                  f'Mean: {omic_total_attention[_name] / len(omic_feature_dfs[_name]):.5f}')
+    _ax.tick_params(axis='y', labelsize=5)
 # Top Features Before Saturation
-ax2 = fig.add_subplot(gs[0, 2])
-colors = top_features['Type'].map({'Omic1_feature': OMIC1_COLOR, 'Omic2_feature': OMIC2_COLOR})
+ax2 = fig.add_subplot(gs[0, len(OMIC_NAMES)])
+_type_to_color = {f'{_name}_feature': OMIC_COLORS[_name] for _name in OMIC_NAMES}
+colors = top_features['Type'].map(_type_to_color)
 ax2.barh(top_features['Feature'], top_features['Attention'], color=colors)
 ax2.invert_yaxis()
 ax2.set_xlabel('Attention Score')
 ax2.set_title(f'Features Before Saturation\nTop {top_features.shape[0]}/{saturation_x} Features to reach {saturation_threshold}%')
 ax2.tick_params(axis='y', labelsize=3)
-ax2.legend(handles=[Patch(facecolor=OMIC1_COLOR, label='Omic 1'), Patch(facecolor=OMIC2_COLOR, label='Omic 2')],
+ax2.legend(handles=[Patch(facecolor=OMIC_COLORS[_name], label=_name) for _name in OMIC_NAMES],
            loc='lower right', fontsize=8)
 # Cumulative Attention Curve
 ax3 = fig.add_subplot(gs[1, :])
@@ -1420,15 +1515,18 @@ import igraph as ig
 import leidenalg
 from collections import defaultdict, Counter
 
-num_genes_total = encoded_trans.shape[0]
+# Map every graph feature-node index -> which omic it belongs to - generalizes the
+# original script's single num_genes_total cutoff (idx < num_genes_total -> gene,
+# else metabolite) to an arbitrary number of omics.
+FEATURE_OMIC_SIZES = {name: omic_matrices[name].shape[0] for name in OMIC_NAMES}
+FEATURE_INDEX_TO_OMIC = np.concatenate([[name] * FEATURE_OMIC_SIZES[name] for name in OMIC_NAMES])
 
 # Map every graph node index -> its feature/sample name, in the same order used
-# throughout (genes, then metabolites, then samples - see utils.build_data()).
-full_node_names = pd.concat([
-    omic_1_df['ID'].reset_index(drop=True),
-    omic_2_df['ID'].reset_index(drop=True),
-    pd.Series(common_samples)
-], ignore_index=True)
+# throughout (each omic in manifest order, then samples - see utils.build_data_generic()).
+full_node_names = pd.concat(
+    [omic_dfs[name]['ID'].reset_index(drop=True) for name in OMIC_NAMES] + [pd.Series(common_samples)],
+    ignore_index=True
+)
 
 name_to_node_idx = {}
 for i, name in enumerate(full_node_names):
@@ -1464,7 +1562,7 @@ for idx, name in zip(top_feature_node_idx, top_feature_names_found):
     G_leiden.add_node(
         idx,
         name=name,
-        type=('gene' if idx < num_genes_total else 'metabolite'),
+        type=FEATURE_INDEX_TO_OMIC[idx],
         attention=float(feature_attention_lookup.get(name, 0.0))
     )
 
@@ -1488,12 +1586,10 @@ for (src, tgt), weight in zip(edge_summary['pair'], edge_summary['mean_attention
         continue
     src_type = G_leiden.nodes[src]['type']
     tgt_type = G_leiden.nodes[tgt]['type']
-    if src_type == tgt_type == 'gene':
-        edge_type = 'gene-gene'
-    elif src_type == tgt_type == 'metabolite':
-        edge_type = 'metabolite-metabolite'
+    if src_type == tgt_type:
+        edge_type = f'{src_type}-{src_type}'
     else:
-        edge_type = 'gene-metabolite'
+        edge_type = '-'.join(sorted((src_type, tgt_type)))
     G_leiden.add_edge(src, tgt, weight=float(weight), edge_type=edge_type)
 
 isolated_nodes = list(nx.isolates(G_leiden))
@@ -1620,9 +1716,10 @@ else:
 
         fig, ax = plt.subplots(figsize=(9.5, 9.5))
         nx.draw_networkx_edges(G_cluster, pos, width=widths, alpha=0.18, edge_color="#4a4a4a", ax=ax)
-        # Marker shape encodes each program's dominant omic type (gene- vs metabolite-
-        # dominant), an attribute that was already computed but previously unused visually.
-        for dom_type, marker in [('gene', 'o'), ('metabolite', 'D')]:
+        # Marker shape encodes each program's dominant omic type, an attribute that
+        # was already computed but previously unused visually.
+        for dom_type in OMIC_NAMES:
+            marker = OMIC_MARKERS_BY_NAME[dom_type]
             nodes_of_type = [n for n in G_cluster.nodes() if G_cluster.nodes[n]['dominant_type'] == dom_type]
             if not nodes_of_type:
                 continue
@@ -1659,10 +1756,9 @@ else:
         )
         # Legends: marker shape = dominant omic type, reference circles = program size.
         shape_legend = ax.legend(
-            handles=[Line2D([0], [0], marker='o', color='w', markerfacecolor='#888888',
-                             markeredgecolor='black', markersize=9, label='Gene-dominant program'),
-                     Line2D([0], [0], marker='D', color='w', markerfacecolor='#888888',
-                             markeredgecolor='black', markersize=8, label='Metabolite-dominant program')],
+            handles=[Line2D([0], [0], marker=OMIC_MARKERS_BY_NAME[_name], color='w', markerfacecolor='#888888',
+                             markeredgecolor='black', markersize=9, label=f'{_name}-dominant program')
+                     for _name in OMIC_NAMES],
             loc='upper left', fontsize=8, title='Program type', title_fontsize=8
         )
         ax.add_artist(shape_legend)
@@ -1691,9 +1787,10 @@ else:
 
     def draw_cluster_attention_subgraph(G_full, target_cluster, figsize=(11, 11), seed=7):
         """
-        Subsets G_full to one Leiden cluster and draws its attention subnetwork:
-        genes as circles, metabolites as diamonds, edges/nodes colored blue->red by
-        attention (RdBu_r). Returns the matplotlib Figure, or None if the cluster is empty.
+        Subsets G_full to one Leiden cluster and draws its attention subnetwork: each
+        omic gets its own marker shape (OMIC_MARKERS_BY_NAME), edges/nodes colored
+        blue->red by attention (RdBu_r). Returns the matplotlib Figure, or None if the
+        cluster is empty.
         """
         cluster_nodes = [n for n, d in G_full.nodes(data=True) if d.get('leiden_cluster') == target_cluster]
         if not cluster_nodes:
@@ -1731,12 +1828,12 @@ else:
             x1, y1 = pos[v]
             ax.plot([x0, x1], [y0, y1], color=edge_color, lw=edge_width, alpha=0.6, zorder=1)
 
-        # ─── Nodes (split by type for different marker shapes) ───
-        genes = [n for n in G_sub.nodes if G_sub.nodes[n].get('type') == 'gene']
-        metabolites = [n for n in G_sub.nodes if G_sub.nodes[n].get('type') == 'metabolite']
+        # ─── Nodes (split by omic for different marker shapes) ───
+        nodes_by_omic = {_name: [n for n in G_sub.nodes if G_sub.nodes[n].get('type') == _name] for _name in OMIC_NAMES}
         node_groups = [
-            {'nodes': genes, 'marker': 'o', 'base_size': 200, 'scale_size': 800, 'label': 'Gene'},
-            {'nodes': metabolites, 'marker': 'D', 'base_size': 150, 'scale_size': 600, 'label': 'Metabolite'}
+            {'nodes': nodes_by_omic[_name], 'marker': OMIC_MARKERS_BY_NAME[_name],
+             'base_size': 200, 'scale_size': 800, 'label': _name}
+            for _name in OMIC_NAMES
         ]
         for group in node_groups:
             if not group['nodes']:
@@ -1769,12 +1866,11 @@ else:
 
         # Explicit neutral-gray legend proxies for shape - the actual markers are colored
         # by attention (RdBu_r, see colorbar below), so a legend built from those same
-        # per-point colors would misleadingly imply color varies by gene/metabolite too.
+        # per-point colors would misleadingly imply color varies by omic too.
         ax.legend(
-            handles=[Line2D([0], [0], marker='o', color='w', markerfacecolor='#999999',
-                             markeredgecolor='black', markersize=10, label='Gene'),
-                     Line2D([0], [0], marker='D', color='w', markerfacecolor='#999999',
-                             markeredgecolor='black', markersize=9, label='Metabolite')],
+            handles=[Line2D([0], [0], marker=OMIC_MARKERS_BY_NAME[_name], color='w', markerfacecolor='#999999',
+                             markeredgecolor='black', markersize=10, label=_name)
+                     for _name in OMIC_NAMES],
             loc='upper left', frameon=True, facecolor='#FFFFFF', edgecolor='#E0E0E0', fontsize=10
         )
 
@@ -1791,7 +1887,7 @@ else:
 
         ax.set_title(
             f'Multi-Omic Attention Subgraph — Leiden Cluster {target_cluster}\n'
-            f'({len(genes)} Genes · {len(metabolites)} Metabolites)',
+            f'({" · ".join(f"{len(nodes_by_omic[_name])} {_name}" for _name in OMIC_NAMES)})',
             fontsize=13, fontweight='bold', pad=18
         )
         _frame_axes_to_pos(ax, pos)
@@ -1820,15 +1916,15 @@ else:
     if not valid_clusters:
         print("Leiden clustering: no clusters passed the minimum size filter, skipping program activity scores.")
     else:
-        # `samples` is the (genes+metabolites) x samples matrix built from the raw
-        # omic1/omic2 input matrices earlier in the script, row-aligned with the same
-        # global feature index used throughout this section (idx < num_genes_total ->
-        # gene row in omic_1, else metabolite row in omic_2).
+        # `samples_stacked` is the (every omic's features stacked) x samples matrix
+        # built from the raw per-omic input matrices earlier in the script,
+        # row-aligned with the same global feature index used throughout this section
+        # (FEATURE_INDEX_TO_OMIC[idx] gives idx's omic).
         program_activity = pd.DataFrame(index=common_samples)
         for cid in sorted(valid_clusters):
             member_idx = [n for n, c in node_to_cluster.items() if c == cid]
             member_attention = np.array([G_leiden.nodes[n]['attention'] for n in member_idx])
-            member_expression = samples[member_idx, :]  # (n_members, n_samples)
+            member_expression = samples_stacked[member_idx, :]  # (n_members, n_samples)
             program_activity[f'Program_{cid}'] = member_attention @ member_expression
         program_activity.index.name = 'ID'
         program_activity_csv_path = plots_dir + "leiden_program_activity_scores.csv"
@@ -1866,10 +1962,10 @@ def to_numpy(x):
 # Prepare Embeddings & Labels
 # ----------------------------------
 labels = metadata.CONDITION.reset_index(drop=True)
-node_names = omic_1_df.columns[1:]
+node_names = omic_dfs[OMIC_NAMES[0]].columns[1:]
 
 embeddings = {
-    'Cell Nodes': to_numpy(node_rep[node_type == 2]),
+    'Cell Nodes': to_numpy(node_rep[node_type == len(OMIC_NAMES)]),
     'g128 Embedding': to_numpy(g128_embeddings),
     'g64 Embedding': to_numpy(g64_embeddings),
     'g32 Embedding': to_numpy(g32_embeddings),
@@ -2024,7 +2120,7 @@ else:
             high_mask = condition_labels == g_high
             signed_scores = []
             for idx in member_idx:
-                mean_diff = samples[idx, high_mask].mean() - samples[idx, low_mask].mean()
+                mean_diff = samples_stacked[idx, high_mask].mean() - samples_stacked[idx, low_mask].mean()
                 sign = np.sign(mean_diff) or 1.0
                 signed_scores.append(G_leiden.nodes[idx]['attention'] * sign)
             signed_scores = np.array(signed_scores)
@@ -2123,10 +2219,10 @@ else:
 #from matplotlib.lines import Line2D
 #from matplotlib.patches import Patch
 
-# Step 1: Select top 100 genes and top 100 metabolites by attention
+# Step 1: Select top 100 features per omic by attention
 top_n = 100
-top_genes = gene_node_attention.sort_values(by='Attention', ascending=False).head(top_n)
-top_metabolites = metabo_node_attention.sort_values(by='Attention', ascending=False).head(top_n)
+top_by_omic = {_name: omic_node_attention[_name].sort_values(by='Attention', ascending=False).head(top_n)
+                for _name in OMIC_NAMES}
 attention_network = pd.concat([df2.iloc[:, [0, 1]], pd.DataFrame(edge_attn.T)],axis=1)
 attention_network.columns = ['source', 'target', 'weight']
 
@@ -2134,24 +2230,20 @@ attention_network.columns = ['source', 'target', 'weight']
 samples = metadata[['ID', 'CONDITION']].reset_index(drop=True)
 
 # Create node lists
-node_labels = pd.concat([
-    top_genes['Omic_1_ID'].reset_index(drop=True),
-    top_metabolites['Omic_2_ID'].reset_index(drop=True),
-    samples['ID'].reset_index(drop=True)
-])
-node_attention = np.concatenate([
-    top_genes['Attention'].values,
-    top_metabolites['Attention'].values,
-    np.zeros(len(samples))  # Samples may not have attention scores
-])
-node_types = np.array(
-    [0] * len(top_genes) +  # Genes
-    [1] * len(top_metabolites) +  # Metabolites
-    [2] * len(samples)  # Samples
+node_labels = pd.concat(
+    [top_by_omic[_name][f'{_name}_ID'].reset_index(drop=True) for _name in OMIC_NAMES]
+    + [samples['ID'].reset_index(drop=True)]
+)
+node_attention = np.concatenate(
+    [top_by_omic[_name]['Attention'].values for _name in OMIC_NAMES]
+    + [np.zeros(len(samples))]  # Samples may not have attention scores
+)
+node_types = np.concatenate(
+    [np.full(len(top_by_omic[_name]), _oi) for _oi, _name in enumerate(OMIC_NAMES)]
+    + [np.full(len(samples), len(OMIC_NAMES))]  # Samples get the next type index after every omic
 )
 node_shapes = (
-    ['triangle'] * len(top_genes) +
-    ['square'] * len(top_metabolites) +
+    sum(([OMIC_PLOTLY_SHAPES_BY_NAME[_name]] * len(top_by_omic[_name]) for _name in OMIC_NAMES), []) +
     ['circle'] * len(samples)
 )
 
@@ -2159,10 +2251,17 @@ node_shapes = (
 G = nx.Graph()
 
 num_samples = len(samples)
-gene_indices = np.array(top_genes.index)
-metabo_indices = np.array(top_metabolites.index)+gene_node_attention.shape[0]
-sample_indices = np.array(range(num_samples))+(gene_node_attention.shape[0]+metabo_node_attention.shape[0])
-all_selected_indices = np.concatenate([gene_indices, metabo_indices,sample_indices])
+sample_type_idx = len(OMIC_NAMES)
+# Node ids are offset by each omic's FULL feature count (matching the global feature
+# index used throughout the script - see FEATURE_INDEX_TO_OMIC), not by the top-N
+# subset size, so they line up with attention_network's source/target ids.
+omic_indices = {}
+_cum = 0
+for _name in OMIC_NAMES:
+    omic_indices[_name] = np.array(top_by_omic[_name].index) + _cum
+    _cum += omic_node_attention[_name].shape[0]
+sample_indices = np.array(range(num_samples)) + _cum
+all_selected_indices = np.concatenate([omic_indices[_name] for _name in OMIC_NAMES] + [sample_indices])
 # Add nodes with attributes
 #for i, (label, shape, node_type, att) in zip(all_selected_indices, zip(node_labels, node_shapes, node_types, node_attention)):
 #    G.add_node(i, label=label, shape=shape, node_type=node_type, importance=att)
@@ -2170,13 +2269,7 @@ for i, (label, shape, node_type) in zip(all_selected_indices, zip(node_labels, n
     G.add_node(i, label=label, shape=shape, node_type=node_type)
 
 # Step 3: Filter edges to include only those between selected nodes
-#num_genes = len(top_genes)
-#num_metabolites = len(top_metabolites)
-#num_samples = len(samples)
-#gene_indices = np.array(top_genes.index)
-#metabo_indices = np.array(top_metabolites.index)+gene_node_attention.shape[0]
-#sample_indices = np.array(range(num_samples))+(gene_node_attention.shape[0]+metabo_node_attention.shape[0])
-valid_nodes = set(gene_indices).union(metabo_indices).union(sample_indices)
+valid_nodes = set(all_selected_indices)
 attention_filtered = attention_network[
     (attention_network['source'].isin(valid_nodes)) & (attention_network['target'].isin(valid_nodes))
 ].copy()
@@ -2225,22 +2318,16 @@ node_types = [G.nodes[node]['node_type'] for node in G.nodes]
 #node_attention = [G.nodes[node]['importance'] for node in G.nodes]
 
 # Step 5: Determine edge types
+type_idx_to_name = dict(enumerate(OMIC_NAMES))
+
+def _node_type_name(t):
+    return 'sample' if t == sample_type_idx else type_idx_to_name[t]
+
 edge_types = []
 for u, v in G.edges:
-    source_type = G.nodes[u]['node_type']
-    target_type = G.nodes[v]['node_type']
-    if source_type == 0 and target_type == 0:
-        edge_types.append('omic1-omic1')
-    elif source_type == 0 and target_type == 1 or source_type == 1 and target_type == 0:
-        edge_types.append('omic1-omic2')
-    elif source_type == 0 and target_type == 2 or source_type == 2 and target_type == 0:
-        edge_types.append('omic1-sample')
-    elif source_type == 1 and target_type == 1:
-        edge_types.append('omic2-omic2')
-    elif source_type == 1 and target_type == 2 or source_type == 2 and target_type == 1:
-        edge_types.append('omic2-sample')
-    else:  # source_type == 2 and target_type == 2
-        edge_types.append('sample-sample')
+    s_name = _node_type_name(G.nodes[u]['node_type'])
+    t_name = _node_type_name(G.nodes[v]['node_type'])
+    edge_types.append(f'{s_name}-{s_name}' if s_name == t_name else '-'.join(sorted((s_name, t_name))))
 
 # Step 6: Plotting
 plt.figure(figsize=(12, 12))
@@ -2261,28 +2348,25 @@ if np.std(_pos_xs) < 0.05 or np.std(_pos_ys) < 0.05:
 
 #import plotly.graph_objects as go
 
-shape_map = {
-    'triangle': 'triangle-up',
-    'square': 'square',
-    'circle': 'circle'
-}
+# node_shapes already stores final Plotly symbol names (OMIC_PLOTLY_SHAPES_BY_NAME /
+# 'circle' for samples - see Step 1 above), so no shape_map translation is needed here.
 
 # Color maps - reuse the same colorblind-safe, cross-figure-consistent palette as
 # every other plot in this script (see PUBLICATION STYLE at the top of the file).
 condition_color_map = {cond: hex_to_rgb_string(color) for cond, color in CONDITION_COLORS.items()}
-node_type_colors = {
-    0: hex_to_rgb_string(OMIC1_COLOR),  # genes
-    1: hex_to_rgb_string(OMIC2_COLOR),  # metabolites
-    2: None  # Samples by condition
-}
-edge_type_colors = {
-    'omic1-omic1': hex_to_rgb_string(OMIC1_COLOR),
-    'omic1-omic2': 'rgb(140, 140, 140)',    # neutral - cross-omic edges shouldn't fight for attention
-    'omic1-sample': 'rgb(210, 210, 210)',   # faint - de-emphasize the dense omic-sample fan-out
-    'omic2-omic2': hex_to_rgb_string(OMIC2_COLOR),
-    'omic2-sample': 'rgb(210, 210, 210)',
-    'sample-sample': 'rgb(60, 60, 60)'
-}
+node_type_colors = {_oi: hex_to_rgb_string(OMIC_COLORS[_name]) for _oi, _name in enumerate(OMIC_NAMES)}
+node_type_colors[sample_type_idx] = None  # Samples by condition
+
+edge_type_colors = {}
+for _name in OMIC_NAMES:
+    edge_type_colors[f'{_name}-{_name}'] = hex_to_rgb_string(OMIC_COLORS[_name])
+for _a, _b in itertools.combinations(OMIC_NAMES, 2):
+    # neutral - cross-omic edges shouldn't fight for attention
+    edge_type_colors['-'.join(sorted((_a, _b)))] = 'rgb(140, 140, 140)'
+for _name in OMIC_NAMES:
+    # faint - de-emphasize the dense omic-sample fan-out
+    edge_type_colors['-'.join(sorted((_name, 'sample')))] = 'rgb(210, 210, 210)'
+edge_type_colors['sample-sample'] = 'rgb(60, 60, 60)'
 
 # Prepare node data
 node_x, node_y, node_colors, node_symbols, node_hover = [], [], [], [], []
@@ -2292,15 +2376,14 @@ for node in G.nodes(data=True):
     node_y.append(y)
     node_type = node[1]['node_type']
     label = node[1]['label']
-    if node_type == 2:
+    if node_type == sample_type_idx:
         condition = metadata.loc[metadata.ID == label, 'CONDITION'].values[0]
         node_colors.append(condition_color_map[condition])
         node_hover.append(f"Sample: {label}<br>Condition: {condition}")
     else:
         node_colors.append(node_type_colors[node_type])
-        node_type_name = 'Gene' if node_type == 0 else 'Metabolite'
-        node_hover.append(f"{node_type_name}: {label}")
-    node_symbols.append(shape_map[node[1]['shape']])
+        node_hover.append(f"{type_idx_to_name[node_type]}: {label}")
+    node_symbols.append(node[1]['shape'])
 
 # Prepare edge data by type
 edge_traces = []
@@ -2351,15 +2434,11 @@ legend_items = [
     go.Scatter(
         x=[None], y=[None],
         mode='markers',
-        marker=dict(size=10, color='blue', symbol='triangle-up'),
-        name='Gene'
-    ),
-    go.Scatter(
-        x=[None], y=[None],
-        mode='markers',
-        marker=dict(size=10, color='green', symbol='square'),
-        name='Metabolite'
-    ),
+        marker=dict(size=10, color=hex_to_rgb_string(OMIC_COLORS[_name]), symbol=OMIC_PLOTLY_SHAPES_BY_NAME[_name]),
+        name=_name
+    )
+    for _name in OMIC_NAMES
+] + [
     go.Scatter(
         x=[None], y=[None],
         mode='markers',
@@ -2380,7 +2459,7 @@ for item in legend_items:
 
 # Update layout
 fig.update_layout(
-    title="Network Visualization: Top 100 Genes, Top 100 Metabolites, All Samples",
+    title=f"Network Visualization: Top {top_n} Features per Omic ({', '.join(OMIC_NAMES)}), All Samples",
     showlegend=True,
     legend=dict(x=1, y=1, xanchor='left', yanchor='top'),
     hovermode='closest',
@@ -2417,7 +2496,7 @@ print(f"High-degree nodes (>50):\n{degrees[degrees > 50]}")
 # the size filter).
 
 from matplotlib.backends.backend_pdf import PdfPages
-from scipy.stats import mannwhitneyu
+from scipy.stats import mannwhitneyu, kruskal
 
 print("\n=== Generating supplementary visualizations ===")
 
@@ -2510,30 +2589,38 @@ def _cumulative_pct(values):
     total = c[-1] if len(c) and c[-1] > 0 else 1
     return 100 * np.arange(1, len(s) + 1) / max(len(s), 1), 100 * c / total
 
-gene_rank_pct, gene_cum_pct = _cumulative_pct(gene_df['Attention'].values)
-metabo_rank_pct, metabo_cum_pct = _cumulative_pct(metabo_df['Attention'].values)
 fig, ax = plt.subplots(figsize=(7, 5.5))
-ax.plot(gene_rank_pct, gene_cum_pct, color=OMIC1_COLOR, linewidth=2, label=f'Omic 1 (n={len(gene_df)})')
-ax.plot(metabo_rank_pct, metabo_cum_pct, color=OMIC2_COLOR, linewidth=2, label=f'Omic 2 (n={len(metabo_df)})')
+for _name in OMIC_NAMES:
+    _rank_pct, _cum_pct = _cumulative_pct(omic_feature_dfs[_name]['Attention'].values)
+    ax.plot(_rank_pct, _cum_pct, color=OMIC_COLORS[_name], linewidth=2,
+            label=f'{_name} (n={len(omic_feature_dfs[_name])})')
 ax.plot([0, 100], [0, 100], color='#cccccc', linestyle=':', linewidth=1, label='Uniform (no concentration)')
 ax.set_xlabel('Features Ranked by Attention (% of that omic layer)')
 ax.set_ylabel('Cumulative Attention (%)')
-ax.set_title('Attention Concentration: Omic 1 vs. Omic 2')
+ax.set_title('Attention Concentration by Omic')
 ax.legend(loc='lower right', fontsize=9)
 plt.tight_layout()
 plt.savefig(supplementary_dir + "attention_concentration_by_omic.pdf")
 plt.close(fig)
 
-_, p_omic = mannwhitneyu(gene_df['Attention'], metabo_df['Attention'], alternative='two-sided')
-fig, ax = plt.subplots(figsize=(6, 5.5))
-parts = ax.violinplot([gene_df['Attention'].values, metabo_df['Attention'].values], showmedians=True)
-for pc, color in zip(parts['bodies'], [OMIC1_COLOR, OMIC2_COLOR]):
-    pc.set_facecolor(color)
+# Kruskal-Wallis across every omic when there are more than 2 (Mann-Whitney U is only
+# defined for exactly 2 groups - the original script's fixed comparison).
+_omic_attention_groups = [omic_feature_dfs[_name]['Attention'].values for _name in OMIC_NAMES]
+if len(OMIC_NAMES) == 2:
+    _, p_omic = mannwhitneyu(*_omic_attention_groups, alternative='two-sided')
+    _stat_label = f'Mann-Whitney U: p={p_omic:.3g}'
+else:
+    _kw_stat, p_omic = kruskal(*_omic_attention_groups)
+    _stat_label = f'Kruskal-Wallis: p={p_omic:.3g}'
+fig, ax = plt.subplots(figsize=(max(6, 1.3 * len(OMIC_NAMES)), 5.5))
+parts = ax.violinplot(_omic_attention_groups, showmedians=True)
+for pc, _name in zip(parts['bodies'], OMIC_NAMES):
+    pc.set_facecolor(OMIC_COLORS[_name])
     pc.set_alpha(0.7)
-ax.set_xticks([1, 2])
-ax.set_xticklabels(['Omic 1', 'Omic 2'])
+ax.set_xticks(range(1, len(OMIC_NAMES) + 1))
+ax.set_xticklabels(OMIC_NAMES)
 ax.set_ylabel('Attention Score')
-ax.set_title(f'Attention Score Distribution by Omic Type\nMann-Whitney U: p={p_omic:.3g}')
+ax.set_title(f'Attention Score Distribution by Omic Type\n{_stat_label}')
 plt.tight_layout()
 plt.savefig(supplementary_dir + "attention_distribution_by_omic.pdf")
 plt.close(fig)
@@ -2551,13 +2638,12 @@ else:
     )
     prog_labels = [f'Program {cid}' for cid, _, _ in size_summary]
     prog_sizes = [s for _, s, _ in size_summary]
-    prog_colors = [OMIC1_COLOR if t == 'gene' else OMIC2_COLOR for _, _, t in size_summary]
+    prog_colors = [OMIC_COLORS[t] for _, _, t in size_summary]
     fig, ax = plt.subplots(figsize=(7, max(4, 0.35 * len(size_summary))))
     ax.barh(prog_labels, prog_sizes, color=prog_colors, edgecolor='black', linewidth=0.4)
     ax.set_xlabel('Number of Features')
     ax.set_title('Multi-Omic Program Sizes')
-    ax.legend(handles=[Patch(facecolor=OMIC1_COLOR, label='Gene-dominant'),
-                        Patch(facecolor=OMIC2_COLOR, label='Metabolite-dominant')],
+    ax.legend(handles=[Patch(facecolor=OMIC_COLORS[_name], label=f'{_name}-dominant') for _name in OMIC_NAMES],
               loc='lower right', fontsize=8)
     plt.tight_layout()
     plt.savefig(supplementary_dir + "program_size_ranked.pdf")
@@ -2582,10 +2668,10 @@ else:
 if not valid_clusters:
     print("Supplementary: skipping per-program feature figures (no valid Leiden clusters).")
 else:
-    # (genes+metabolites) x samples, same row index as G_leiden node ids (see the Leiden
-    # clustering section above) - recomputed locally since `samples` was repurposed as a
-    # metadata frame in the Network Visualization section above.
-    feature_matrix = np.concatenate((omic_1, omic_2), axis=0)
+    # (every omic's features stacked) x samples, same row index as G_leiden node ids
+    # (see the Leiden clustering section above) - recomputed locally since `samples`
+    # was repurposed as a metadata frame in the Network Visualization section above.
+    feature_matrix = np.concatenate([omic_matrices[_name] for _name in OMIC_NAMES], axis=0)
 
     importance_pdf_path = supplementary_dir + "program_feature_importance_ranked.pdf"
     with PdfPages(importance_pdf_path) as pdf:
@@ -2709,7 +2795,7 @@ degree_series = pd.Series(dict(G.degree()))
 top_hubs = degree_series.sort_values(ascending=False).head(20)
 hub_types = [G.nodes[n]['node_type'] for n in top_hubs.index]
 hub_names = [G.nodes[n]['label'] for n in top_hubs.index]
-hub_colors = [OMIC1_COLOR if t == 0 else (OMIC2_COLOR if t == 1 else '#888888') for t in hub_types]
+hub_colors = [OMIC_COLORS[type_idx_to_name[t]] if t in type_idx_to_name else '#888888' for t in hub_types]
 fig, ax = plt.subplots(figsize=(7, max(4, 0.32 * len(top_hubs))))
 y_pos = np.arange(len(top_hubs))[::-1]
 ax.barh(y_pos, top_hubs.values, color=hub_colors, edgecolor='black', linewidth=0.3)
@@ -2717,8 +2803,8 @@ ax.set_yticks(y_pos)
 ax.set_yticklabels(hub_names, fontsize=7)
 ax.set_xlabel('Degree (number of connections)')
 ax.set_title('Top 20 Hub Nodes in the Attention Network')
-ax.legend(handles=[Patch(facecolor=OMIC1_COLOR, label='Gene'), Patch(facecolor=OMIC2_COLOR, label='Metabolite'),
-                    Patch(facecolor='#888888', label='Sample')], loc='lower right', fontsize=8)
+ax.legend(handles=[Patch(facecolor=OMIC_COLORS[_name], label=_name) for _name in OMIC_NAMES] +
+                   [Patch(facecolor='#888888', label='Sample')], loc='lower right', fontsize=8)
 plt.tight_layout()
 plt.savefig(supplementary_dir + "network_hub_nodes.pdf")
 plt.close(fig)

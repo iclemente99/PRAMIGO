@@ -1,5 +1,7 @@
 import numpy as np
+import itertools
 from collections import defaultdict
+from utils import relation_name
 
 def norm_rowcol(matrix):
     # 按行求和
@@ -97,5 +99,65 @@ def sub_sample(graph, GAS_gene_sample, GAS_metabo_sample, GAS_gene_metabo,
     # sample <-> sample (symmetric mask)
     sub = mask_sample_sample[np.ix_(sample_indices, sample_indices)]
     edge_list['sample']['sample']['s_s'] = _edge_pairs(sub, target_is_columns=False)
+
+    return feature, times, edge_list, indxs
+
+
+def sub_sample_generic(graph, cross_sample_masks, self_masks, sample_mask, cross_omic_masks,
+                        omic_names, sampling_size, omic_sizes, sample_shape, topology='full',
+                        sample_type='sample'):
+    """N-omic generalization of sub_sample() above. Same sampling strategy - pick a
+    random batch of samples, then for each omic pick its top `omic_sizes[name]`
+    features by how strongly they connect to the sampled samples - just driven by
+    dicts/lists keyed on omic name instead of two hardcoded gene/metabolite branches.
+
+    `cross_omic_masks` is only consulted when topology == 'full' (an empty dict
+    under 'star' is fine and produces zero omic-omic edges, at zero extra cost -
+    no O(k^2) pairs are ever iterated in that case).
+
+    Relation names come from utils.relation_name(), which build_graph_generic() also
+    uses, so a job's edge_list keys always resolve against the full graph's
+    edge_dict (built from graph.get_meta_graph()) regardless of how many omics
+    there are.
+    """
+    sample_indices = np.random.choice(np.arange(sample_shape), sampling_size, replace=False)
+
+    top_indices = {}
+    for name in omic_names:
+        cross = cross_sample_masks[name]
+        sub = cross[:, sample_indices]
+        idx = np.nonzero(np.sum(sub, axis=1))[0]
+        sub2 = cross[idx, :][:, sample_indices]
+        scores = np.sum(sub2, axis=1)
+        top_indices[name] = idx[np.argsort(scores)[::-1][:omic_sizes[name]]]
+
+    feature = {name: graph.node_feature[name][top_indices[name], :] for name in omic_names}
+    feature[sample_type] = graph.node_feature[sample_type][sample_indices, :]
+
+    times = {name: np.ones(len(top_indices[name])) for name in omic_names}
+    times[sample_type] = np.ones(sampling_size)
+
+    indxs = {name: top_indices[name] for name in omic_names}
+    indxs[sample_type] = sample_indices
+
+    edge_list = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+    for name in omic_names:
+        sub = cross_sample_masks[name][np.ix_(top_indices[name], sample_indices)]
+        edge_list[sample_type][name][relation_name(name, sample_type)] = _edge_pairs(sub, target_is_columns=True)
+
+    if topology == 'full':
+        for a, b in itertools.combinations(omic_names, 2):
+            sub = cross_omic_masks[(a, b)][np.ix_(top_indices[a], top_indices[b])]
+            edge_list[b][a][relation_name(a, b)] = _edge_pairs(sub, target_is_columns=True)
+    # topology == 'star': no direct omic-omic edges at all - omics only ever connect
+    # through sample nodes, so cross_omic_masks is never even consulted here.
+
+    for name in omic_names:
+        sub = self_masks[name][np.ix_(top_indices[name], top_indices[name])]
+        edge_list[name][name][relation_name(name, name)] = _edge_pairs(sub, target_is_columns=False)
+
+    sub = sample_mask[np.ix_(sample_indices, sample_indices)]
+    edge_list[sample_type][sample_type][relation_name(sample_type, sample_type)] = _edge_pairs(sub, target_is_columns=False)
 
     return feature, times, edge_list, indxs

@@ -101,7 +101,7 @@ class GNN_class(nn.Module):
         #return meta_xs 
 
 class GNN(nn.Module):
-    def __init__(self, in_dim, n_hid, num_types, num_relations, n_heads, n_layers, n_labels, dropout = 0.2, conv_name = 'hgt', prev_norm = True, last_norm = True, use_RTE = True):
+    def __init__(self, in_dim, n_hid, num_types, num_relations, n_heads, n_layers, n_labels, dropout = 0.2, conv_name = 'hgt', prev_norm = True, last_norm = True, use_RTE = True, sample_type_id = None):
         super(GNN, self).__init__()
         self.gcs = nn.ModuleList()
         self.num_types = num_types
@@ -112,6 +112,13 @@ class GNN(nn.Module):
         self.att =None
         self.emb =None
         self.conv_name = conv_name
+        # Which node-type index is "sample" (the type the classifier head reads out
+        # of). The original PRAMIGO hardcoded this to 2 (valid only for exactly
+        # 2 non-sample omics inserted before it: omic1=0, omic2=1, sample=2). PRAMIGO_gen
+        # supports an arbitrary number of omics, so the caller must tell us which type
+        # index is "sample" (defaults to 2 to preserve the original behavior when the
+        # caller doesn't pass anything).
+        self.sample_type_id = 2 if sample_type_id is None else sample_type_id
         for t in range(num_types):
             self.adapt_ws.append(nn.Linear(in_dim, n_hid))
         for l in range(n_layers - 1):
@@ -145,7 +152,7 @@ class GNN(nn.Module):
                 #    print(p)                
         #self.att = gc.res_att
         self.att = self.att[0]
-        class_xs = meta_xs[node_type == 2, ]
+        class_xs = meta_xs[node_type == self.sample_type_id, ]
         classifier, g_32, g_64, g_128 = self.mlp(class_xs)
         return meta_xs, classifier, g_32, g_64, g_128
 

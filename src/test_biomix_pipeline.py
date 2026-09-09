@@ -250,16 +250,21 @@ class TestPipelineEndToEnd:
         assert len(total_losses) == 4  # matches FAST_HPARAMS --epoch 4
 
     def test_embeddings_saved_with_expected_shapes(self, request, run_fixture_name):
+        # Per-omic output dirs are named after each omic's manifest `name` (see
+        # omics_manifest.py / biomix_hgt.py's `omic_dirs`), not hardcoded "gene"/
+        # "metabo" - run_biomix() uses the legacy --omic1_path/--omic2_path flags,
+        # which manifest_from_legacy_args() wraps into a 2-entry manifest named
+        # "omic1"/"omic2", so those are the directories a run actually creates.
         _, result_dir = request.getfixturevalue(run_fixture_name)
-        gene_files = os.listdir(os.path.join(result_dir, "gene"))
-        metabo_files = os.listdir(os.path.join(result_dir, "metabo"))
+        omic1_files = os.listdir(os.path.join(result_dir, "omic1"))
+        omic2_files = os.listdir(os.path.join(result_dir, "omic2"))
         sample_files = os.listdir(os.path.join(result_dir, "sample"))
-        assert len(gene_files) == 1 and len(metabo_files) == 1 and len(sample_files) == 1
+        assert len(omic1_files) == 1 and len(omic2_files) == 1 and len(sample_files) == 1
 
-        gene_matrix = pd.read_csv(os.path.join(result_dir, "gene", gene_files[0]), sep=" ", header=None)
-        assert gene_matrix.shape[0] == N_FEATURES_PER_OMIC
-        metabo_matrix = pd.read_csv(os.path.join(result_dir, "metabo", metabo_files[0]), sep=" ", header=None)
-        assert metabo_matrix.shape[0] == N_FEATURES_PER_OMIC
+        omic1_matrix = pd.read_csv(os.path.join(result_dir, "omic1", omic1_files[0]), sep=" ", header=None)
+        assert omic1_matrix.shape[0] == N_FEATURES_PER_OMIC
+        omic2_matrix = pd.read_csv(os.path.join(result_dir, "omic2", omic2_files[0]), sep=" ", header=None)
+        assert omic2_matrix.shape[0] == N_FEATURES_PER_OMIC
         sample_matrix = pd.read_csv(os.path.join(result_dir, "sample", sample_files[0]), sep=" ", header=None)
         assert sample_matrix.shape[0] == N_SAMPLES
 

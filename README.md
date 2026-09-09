@@ -4,7 +4,9 @@
   <img src="docs/pramigopy.png" width="900">
 </p>
 
-PRAMIGO builds a heterogeneous graph over **samples and any two omic layers**, trains a Heterogeneous Graph Transformer (HGT) on it, and returns embeddings, attention-based interpretability, and cluster-level "programs" of co-regulated features — all from a single command.
+PRAMIGO builds a heterogeneous graph over **samples and an arbitrary number of omic layers**, trains a Heterogeneous Graph Transformer (HGT) on it, and returns embeddings, attention-based interpretability, and cluster-level "programs" of co-regulated features — all from a single command.
+
+> This is **PRAMIGO_gen**, a fork of PRAMIGO that generalizes the pipeline from a fixed 2-omic CLI (`--omic1_path`/`--omic2_path`) to an arbitrary-length list of omics, driven by a small YAML/JSON manifest (`--omics_manifest`). The original 2-omic flags still work unchanged (see [Input data](#-input-data) below) — nothing about the 2-omic path changes for existing users.
 
 ---
 
@@ -27,17 +29,66 @@ That's it — no manual dependency wrangling beyond this.
 
 ## 📊 Input data
 
-PRAMIGO expects three TSV files:
+PRAMIGO_gen expects a metadata TSV plus **either** an `--omics_manifest` (any number of omics) **or** the legacy `--omic1_path`/`--omic2_path` pair (exactly 2 omics).
 
 | File | Required columns / shape |
 |---|---|
 | `--metadata_path` | Samples as rows, with at least `ID` (sample identifier) and `CONDITION` (group label) |
-| `--omic1_path` | Features × samples, `ID` column first (e.g. gene expression) |
-| `--omic2_path` | Features × samples, `ID` column first (e.g. metabolomics) |
+| each omic file | Features × samples, `ID` column first (e.g. gene expression, metabolomics, methylomics, ...) |
 
 > ⚠️ **The omic matrices must already be filtered and normalized.** PRAMIGO does **not** perform any filtering, batch correction, or normalization of its own — it consumes the matrices as-is and builds the correlation graph directly from them. Feed it raw or poorly-normalized data and the feature-feature correlation graph (and everything downstream of it) will reflect that noise. A standard choice is per-feature (row-wise) z-scoring after your usual QC/filtering pipeline — see [Simulated toy data](#-simulated-toy-data) below for a worked example of exactly this format. 
 
 > As a general recommendation, we suggest using a **row-wise normalized matrix restricted to the significantly different omic features** identified between groups within each modality.
+
+### The omics manifest (`--omics_manifest`)
+
+For anything beyond 2 omics, point `--omics_manifest` at a YAML or JSON file listing however many omic layers your run needs instead of adding more `--omicN_path`-style flags:
+
+```yaml
+topology: full              # 'full' (default) or 'star' - see Topology below
+sample_mode: intersection   # 'intersection' (default) or 'union' - see Sample coverage below
+omics:
+  - name: transcriptomics
+    path: ./data/rnaseq.tsv
+    rate: 1.0                # optional, defaults to 1.0 - fraction of features sampled per training batch
+    corr_cutoff: 0.7          # optional, defaults to 0.7 - feature-feature correlation threshold for this omic
+    kind: transcriptomics     # optional modality tag, defaults to `name` - see "Same omic twice" below
+  - name: methylomics
+    path: ./data/methyl.tsv
+    corr_cutoff: 0.6
+  - name: metabolomics
+    path: ./data/metab.tsv
+```
+
+`name` must be unique across the manifest — it becomes that omic's node type, output subfolder (`<result_dir>/<name>/`), and plot legend label, so keep it short and filesystem-safe. `topology` and `sample_mode` can also be set at the top level of the manifest as shown, or overridden from the command line with `--topology`/`--sample_mode` (the CLI flag always wins if both are given).
+
+If `--omics_manifest` is omitted, `--omic1_path`/`--omic2_path` (plus their `--omic1_rate`/`--omic2_corr_cutoff`/etc. siblings) are automatically wrapped into an equivalent 2-entry manifest, so every existing 2-omic command still works unchanged.
+
+### Topology: `full` vs. `star` (`--topology`)
+
+Controls whether omic layers connect **directly to each other**, in addition to connecting through sample nodes:
+
+- **`full` (default, matches original PRAMIGO behavior):** every pair of omics gets its own direct feature-feature correlation graph (a specific gene can be wired straight to a specific metabolite). Cost grows as O(k²) in the number of omics — fine for 2-4 omics, worth watching beyond that.
+- **`star`:** omics only ever connect through sample nodes, never directly to each other. Cost is O(k) in the number of omics, at the price of losing that direct cross-omic co-regulation edge.
+
+```bash
+python src/biomix_hgt.py --omics_manifest manifest.yaml --metadata_path ... --result_dir ... --topology star
+```
+
+### Sample coverage: `intersection` vs. `union` (`--sample_mode`)
+
+Controls which samples are kept when not every sample has data in every omic:
+
+- **`intersection` (default, matches original PRAMIGO behavior):** complete-case — only samples present in the metadata *and every single omic* survive. With many omics, this can shrink the usable cohort fast (every extra omic multiplies the chance a sample is missing at least one layer).
+- **`union`:** keep any sample present in the metadata and *at least one* omic. A sample missing a given omic's data gets that omic's feature block zero-filled (so every omic matrix still has one column per kept sample) and, critically, gets **no graph edges** of that omic-sample relation type for that sample — the missingness is carried structurally by the graph (no edges), not by an imputed value pretending to be real data.
+
+```bash
+python src/biomix_hgt.py --omics_manifest manifest.yaml --metadata_path ... --result_dir ... --sample_mode union
+```
+
+### Same omic twice (`kind`)
+
+Tagging two manifest entries with the same `kind` (e.g. two transcriptomics files from different platforms/cohorts of the *same* patients) groups them in reports/plots without merging them into one feature space — each is still its own node type/file. This is safe for the same-cohort, two-platform case. Merging **different cohorts'** data of the same modality is a separate multi-cohort/batch-effect problem (differing sample sets, potential feature-ID mismatches, and a real risk of the graph picking up cohort identity instead of biology) that PRAMIGO_gen does not attempt to solve automatically — do any needed harmonization/batch-correction upstream before feeding the files in.
 
 ---
 
@@ -45,11 +96,22 @@ PRAMIGO expects three TSV files:
 
 ### From the command line
 
+Legacy 2-omic flags (unchanged from PRAMIGO):
+
 ```bash
 python src/biomix_hgt.py \
   --metadata_path "./data/EGAS00001001746/EGAS00001001746_metadata_CLL.tsv" \
   --omic1_path "./data/EGAS00001001746/EGAS00001001746_transcriptomics.tsv" \
   --omic2_path "./data/EGAS00001001746/EGAS00001001746_methylomics.tsv" \
+  --result_dir "./data/EGA_biomix"
+```
+
+Or with a manifest (any number of omics — see [The omics manifest](#the-omics-manifest---omics_manifest) above):
+
+```bash
+python src/biomix_hgt.py \
+  --metadata_path "./data/EGAS00001001746/EGAS00001001746_metadata_CLL.tsv" \
+  --omics_manifest "./data/EGAS00001001746/manifest.yaml" \
   --result_dir "./data/EGA_biomix"
 ```
 
@@ -94,7 +156,10 @@ python src/biomix_hgt.py --resume \
 | `--n_heads` | 8 | Attention heads |
 | `--n_layers` | 2 | Number of HGT layers |
 | `--lr` | 0.0001 | Learning rate |
-| `--omic1_corr_cutoff`, `--omic2_corr_cutoff` | 0.7 | Correlation threshold for building each omic's feature-feature graph edges |
+| `--omics_manifest` | none | YAML/JSON manifest listing an arbitrary number of omics (takes precedence over `--omic1_path`/`--omic2_path`) |
+| `--topology` | `full` | `full` (every omic pair gets direct edges) or `star` (omics only connect through samples) |
+| `--sample_mode` | `intersection` | `intersection` (complete-case) or `union` (partial coverage, missing omics get no edges) |
+| `--omic1_corr_cutoff`, `--omic2_corr_cutoff` | 0.7 | [legacy 2-omic mode] Correlation threshold for building each omic's feature-feature graph edges — use `corr_cutoff:` per-omic in `--omics_manifest` instead |
 | `--leiden_resolution` | 1.5 | Resolution for Leiden clustering of the attention-weighted feature subgraph |
 | `--leiden_min_cluster_size` | 3 | Minimum cluster size to keep in the cluster-network plots |
 | `--cuda` | 1 | **`0` runs on GPU 0; any other value runs on CPU** |
@@ -113,7 +178,7 @@ Everything is written under `--result_dir`, organized into subfolders:
 |---|---|
 | `model/` | `checkpoint_latest.pt` (resumable training state) and the final trained model |
 | `loss/` | Per-epoch CSVs: total, validation, cosine, and cross-entropy loss history |
-| `omic1/`, `omic2/`, `sample/` | Learned embedding matrices for each node type |
+| `<omic_name>/` (one per omic, named after its manifest `name` — `omic1/`/`omic2/` in legacy 2-omic mode), `sample/` | Learned embedding matrices for each node type |
 | `embeddings/` | Classifier-head embeddings at each hidden layer (128 / 64 / 32-dim) plus final class embeddings |
 | `att/` | Per-node attention scores as CSV — the main interpretability output |
 | `plots/` | Core visualizations (see below), always generated |
@@ -122,7 +187,7 @@ Everything is written under `--result_dir`, organized into subfolders:
 **Core visualizations (`plots/`):**
 - `training_loss_components.pdf` — total/validation loss plus loss components over training
 - `Confusion_matrix_figure.pdf` — classification performance on the held-out test split
-- `Interpretability_nodes_attention_figure.pdf` — top attended genes/metabolites
+- `Interpretability_nodes_attention_figure.pdf` — top attended features per omic
 - `embeddings_evaluations_figure.pdf` — embedding quality diagnostics
 - `network_interactive.html` — interactive, browsable version of the integrated graph
 - `leiden_clusters_composition.csv`, `leiden_cluster_network.pdf`, `leiden_cluster_subgraphs.pdf`, `leiden_program_activity_scores.csv`, `leiden_program_activity_report.pdf` — feature "programs" found by Leiden clustering of the attention subgraph. These only appear if at least one cluster meets `--leiden_min_cluster_size`; on very small graphs it's normal for no cluster to form.
