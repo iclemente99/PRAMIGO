@@ -6,7 +6,7 @@
 
 PRAMIGO builds a heterogeneous graph over **samples and an arbitrary number of omic layers**, trains a Heterogeneous Graph Transformer (HGT) on it, and returns embeddings, attention-based interpretability, and cluster-level "programs" of co-regulated features — all from a single command.
 
-> This is **PRAMIGO_gen**, a fork of PRAMIGO that generalizes the pipeline from a fixed 2-omic CLI (`--omic1_path`/`--omic2_path`) to an arbitrary-length list of omics, driven by a small YAML/JSON manifest (`--omics_manifest`). The original 2-omic flags still work unchanged (see [Input data](#-input-data) below) — nothing about the 2-omic path changes for existing users.
+> This version of **PRAMIGO** generalizes the pipeline from a fixed 2-omic CLI (`--omic1_path`/`--omic2_path`) to an arbitrary-length list of omics, driven by a small YAML/JSON manifest (`--omics_manifest`). The original 2-omic flags still work unchanged (see [Input data](#-input-data) below) — nothing about the 2-omic path changes for existing users.
 
 ---
 
