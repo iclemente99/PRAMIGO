@@ -245,6 +245,8 @@ It provisions a fresh `uv` environment from `env/biomixhgt_env.txt`, then runs t
 
 This work was developed through the BiomiX consortium (https://github.com/IxI-97/BiomiX). Please cite accordingly if used in academic research.
 
+> Iñigo Clemente-Larramendi, Jessica Gliozzo, Lourdes Velo-Suárez, Ozvan Bocher, Nathan Foulquier, María Hernández-Valladares, Marc-André Legault, Divi Cornec, Christophe Jamin, Alberto Gil-de-la-Fuente, Álvaro Fernández-Ochoa and Cristian Iperi. BiomiX 3.0: A user-friendly platform for democratized multi-omics integration with graph-based learning. bioRxiv. https://doi.org/10.64898/2026.09.22.753185
+
 ## 🖥️ Maintainers
 
 Iñigo Clemente Larramendi — inigo.clementelarramendi@univ-brest.fr
