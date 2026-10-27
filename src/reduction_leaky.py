@@ -34,6 +34,9 @@ def reduction(method,gene_cell,device,h_n):
         encoded = torch.tensor(gene_cell, dtype=torch.float32).to(device)
         encoded2 = torch.tensor(np.transpose(gene_cell),
                                 dtype=torch.float32).to(device)
+        losses, losses2 = None, None  # no AE was trained
+    else:
+        raise ValueError(f"Unknown reduction method: {method!r}")
     return encoded,encoded2, losses, losses2
 
 def reduction_AE(gene_cell,device,h_n):

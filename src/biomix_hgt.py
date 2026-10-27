@@ -24,9 +24,9 @@ from torch.nn import functional as F
 
 from reduction_leaky import reduction
 from utils import debuginfoStr, build_data_generic, build_graph_generic, relation_name
-from sub_sample import sub_sample_generic
 from pyHGT.model import GNN, GNN_from_raw
 from omics_manifest import resolve_manifest, ManifestError
+from pramigo_figures import square_frame  # square axes, black frame, no grid
 import itertools
 
 from warnings import filterwarnings
@@ -34,6 +34,8 @@ filterwarnings("ignore")
 
 import plotly.graph_objects as go
 import seaborn as sns
+import matplotlib
+import matplotlib.ticker
 import matplotlib.pyplot as plt
 import networkx as nx
 from matplotlib.lines import Line2D
@@ -85,6 +87,12 @@ plt.rcParams.update({
 OKABE_ITO = ["#0072B2", "#D55E00", "#009E73", "#E69F00",
              "#CC79A7", "#56B4E9", "#F0E442", "#000000"]
 
+# Omics and conditions get disjoint colour sets, so a network can show both at once
+# (as in the PTB/CLL network figures: green transcripts, purple metabolites, black CpGs;
+# samples as condition-coloured rings).
+OMIC_PALETTE = ["#009E73", "#6a3d9a", "#000000", "#8c510a", "#999933", "#882255"]
+CONDITION_PALETTE = ["#0072B2", "#E69F00", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442", "#7f7f7f"]
+
 SEQ_CMAP = "viridis"         # every continuous/sequential scale (attention, activity, distance)
 DIV_CMAP = "RdBu_r"          # every diverging/signed scale (blue=low/negative, red=high/positive)
 
@@ -92,7 +100,7 @@ DIV_CMAP = "RdBu_r"          # every diverging/signed scale (blue=low/negative, 
 # hardcoded exactly 2: circle for genes, diamond for metabolites). Cycles if there are
 # more omics than markers - readability of a many-omic figure is a separate, real
 # concern (see design notes) that a bigger marker alphabet alone doesn't solve.
-OMIC_MARKERS = ['o', 'D', 's', '^', 'v', 'P', 'X', '*']
+OMIC_MARKERS = ['^', 'D', 's', 'v', 'P', 'X', '*', 'p']  # 'o' is reserved for samples
 # Plotly symbol cycle for the interactive network plot (network_interactive.html).
 # 'circle' is reserved for sample nodes so it's deliberately excluded here.
 OMIC_PLOTLY_SHAPES = ['triangle-up', 'square', 'diamond', 'star', 'pentagon', 'hexagon2', 'cross', 'x']
@@ -104,8 +112,7 @@ def get_omic_palette(omic_names):
     through OKABE_ITO minus black (reserved for text/outlines) - the same palette
     CONDITION_COLORS draws from, which is fine since omic identity and condition are
     never colored in the same legend at once."""
-    palette = OKABE_ITO[:-1]
-    return {name: palette[i % len(palette)] for i, name in enumerate(omic_names)}
+    return {name: OMIC_PALETTE[i % len(OMIC_PALETTE)] for i, name in enumerate(omic_names)}
 
 
 def get_omic_markers(omic_names):
@@ -128,7 +135,7 @@ def get_condition_palette(condition_values):
     samples by CONDITION, so the same condition is always the same color across
     the whole figure bundle."""
     uniq = sorted(pd.unique(pd.Series(condition_values).astype(str)))
-    return {cond: OKABE_ITO[i % len(OKABE_ITO)] for i, cond in enumerate(uniq)}
+    return {cond: CONDITION_PALETTE[i % len(CONDITION_PALETTE)] for i, cond in enumerate(uniq)}
 
 
 def robust_layout(graph, seed=42, scale=1.0, gap=2.5):
@@ -264,21 +271,28 @@ parser.add_argument('--sample_mode', type=str, default=None, choices=['intersect
                          "given; defaults to 'intersection' if neither is set.")
 parser.add_argument('--epoch', type=int, default=100)
 # sampling times
-parser.add_argument('--n_batch', type=int, default=25,
-                    help='Number of batch (sampled graphs) for each epoch')
+parser.add_argument('--n_batch', type=int, default=32,
+                    help='Number of training subgraphs per epoch (each = all features + a random third of '
+                         'the training samples)')
+parser.add_argument('--val_ratio', type=float, default=0.15,
+                    help='Fraction of samples (per condition) held out for validation')
+parser.add_argument('--test_ratio', type=float, default=0.15,
+                    help='Fraction of samples (per condition) held out for the final test metrics')
 
 parser.add_argument('--omic1_rate', type=float, default=1,
-                    help='[legacy 2-omic mode] Use `rate:` in --omics_manifest instead when using the manifest.')
+                    help='[legacy 2-omic mode] Ignored (kept for compatibility): training subgraphs always keep every feature so they match the inference graph.')
 parser.add_argument('--omic2_rate', type=float, default=1,
-                    help='[legacy 2-omic mode] Use `rate:` in --omics_manifest instead when using the manifest.')
+                    help='[legacy 2-omic mode] Ignored (kept for compatibility): training subgraphs always keep every feature so they match the inference graph.')
 
 # Result
 parser.add_argument('--data_name', type=str,
                     help='The name for dataset')
 parser.add_argument('--result_dir', type=str, required=True,
                     help='The address for storing the models and optimization results.')
-parser.add_argument('--reduction', type=str, default='AE',
-                    help='the method for feature extraction, pca, raw, AE')
+parser.add_argument('--reduction', type=str, default='AE', choices=['AE'],
+                    help='Feature extraction method. Only AE is supported: with raw input, feature nodes '
+                         '(dim = n_samples) and sample nodes (dim = n_features) cannot share one node-feature '
+                         'tensor, and the old raw-mode loss relied on decoder outputs that no longer exist.')
 parser.add_argument('--in_dim', type=int, default=256,
                     help='Number of hidden dimension (AE)')
 parser.add_argument('--omic1_corr_cutoff', type=float, default=0.7,
@@ -287,8 +301,15 @@ parser.add_argument('--omic1_corr_cutoff', type=float, default=0.7,
 parser.add_argument('--omic2_corr_cutoff', type=float, default=0.7,
                     help='[legacy 2-omic mode] Correlation cutoff threshold (0-1) for omic2 feature-feature '
                          'graph edges. Use `corr_cutoff:` in --omics_manifest instead when using the manifest.')
+parser.add_argument('--network_features_per_omic', type=int, nargs='+', default=[100],
+                    help='Top features per omic (by attribution) drawn in plots/network_multiomic.pdf; one page '
+                         'per value, e.g. --network_features_per_omic 10 20 50 100')
 parser.add_argument('--leiden_resolution', type=float, default=1.5,
                     help='Resolution parameter for Leiden clustering of the top-feature attention subgraph')
+parser.add_argument('--target_class', type=str, nargs='+', default=None,
+                    help="Condition(s) whose programs are built (Leiden, program activity, report). "
+                         "One or more CONDITION values (case-insensitive), or 'all'. Default: 'disease'; "
+                         "if no condition is called 'disease', every condition gets its own programs.")
 parser.add_argument('--leiden_min_cluster_size', type=int, default=3,
                     help='Minimum number of features for a Leiden cluster to be kept in the cluster-network plot')
 
@@ -452,7 +473,7 @@ omic_sample_sets = {name: set(df.columns[1:]) for name, df in omic_dfs.items()} 
 if SAMPLE_MODE == 'intersection':
     # Complete-case (PRAMIGO's original behavior): only samples present in the
     # metadata AND every single omic survive.
-    common_samples = list(meta_samples.intersection(*omic_sample_sets.values()))
+    common_samples = sorted(meta_samples.intersection(*omic_sample_sets.values()))  # sorted: set order depends on the per-process string hash seed
     sample_presence = {name: {s: True for s in common_samples} for name in OMIC_NAMES}
 else:
     # Partial-coverage: keep any sample present in the metadata AND at least one
@@ -462,7 +483,7 @@ else:
     # that omic<->sample relation is explicitly zeroed out for that sample further
     # down, so the *graph structure* carries the missingness (no edges of that
     # relation type at all), not an imputed value pretending to be real data.
-    common_samples = list(meta_samples.intersection(set().union(*omic_sample_sets.values())))
+    common_samples = sorted(meta_samples.intersection(set().union(*omic_sample_sets.values())))  # sorted: deterministic sample order across runs
     sample_presence = {name: {s: (s in omic_sample_sets[name]) for s in common_samples} for name in OMIC_NAMES}
     for name in OMIC_NAMES:
         n_missing = sum(1 for present in sample_presence[name].values() if not present)
@@ -498,6 +519,27 @@ label_encoder = LabelEncoder()
 integer_labels = label_encoder.fit_transform(labels)
 one_hot_encoder = OneHotEncoder(sparse=False)
 one_hot_labels = one_hot_encoder.fit_transform(integer_labels.reshape(-1, 1))
+
+# Target condition(s) for the program analysis (--target_class), resolved
+# case-insensitively against the CONDITION values. Fails early on an explicit typo.
+_class_lookup = {str(c).lower(): i for i, c in enumerate(label_encoder.classes_)}
+if args.target_class is None or [t.lower() for t in args.target_class] == ['disease']:
+    _requested = ['disease']
+    _explicit = args.target_class is not None
+else:
+    _requested, _explicit = args.target_class, True
+if [t.lower() for t in _requested] == ['all']:
+    TARGET_CLASS_IDX = list(range(len(label_encoder.classes_)))
+elif all(t.lower() in _class_lookup for t in _requested):
+    TARGET_CLASS_IDX = list(dict.fromkeys(_class_lookup[t.lower()] for t in _requested))
+elif not _explicit:
+    print(f"NOTE: no condition is called 'disease' (conditions: {list(label_encoder.classes_)}); "
+          f"building programs for every condition. Use --target_class to choose.")
+    TARGET_CLASS_IDX = list(range(len(label_encoder.classes_)))
+else:
+    raise SystemExit(f"--target_class {args.target_class}: unknown condition(s). "
+                     f"Available: {list(label_encoder.classes_)} (or 'all').")
+print(f"Program analysis target condition(s): {[str(label_encoder.classes_[c]) for c in TARGET_CLASS_IDX]}")
 
 # Per-omic autoencoder feature reduction - generalizes the original script's two
 # hand-written reduction() calls (one per omic) to a loop over however many omics
@@ -540,12 +582,17 @@ debuginfoStr('Feature extraction finished') # Print verbose
 
 
 def compute_binary_correlation_mask(A, B, ae_n_hid, threshold=0.7):
-    # Normalize embeddings for Pearson correlation
-    A_norm = A
-    B_norm = B
-    # Pearson correlation = cosine similarity of standardized vectors
-    corr = np.dot(A_norm, B_norm.T) / ae_n_hid  # ae_n_hid is the embedding dimension
-    return (corr >= threshold).astype(np.uint8)  # Binary mask: 1 if corr >= threshold
+    # Exact Pearson correlation between the rows of A and B: re-standardize each row
+    # with the population std (ddof=0) so that dot / dim is exactly r. (The inputs were
+    # z-scored with torch's unbiased std, which made the old dot / ae_n_hid equal to
+    # r * (n-1)/n, i.e. a slightly stricter cutoff than the one requested.)
+    def _standardize(X):
+        X = np.asarray(X, dtype=np.float64)
+        return (X - X.mean(axis=1, keepdims=True)) / (X.std(axis=1, keepdims=True) + 1e-8)
+    corr = np.dot(_standardize(A), _standardize(B).T) / A.shape[1]
+    # |r| >= threshold: strongly anti-correlated features are linked too, not only
+    # positively correlated ones. The edge is unsigned; only its presence is encoded.
+    return (np.abs(corr) >= threshold).astype(np.uint8)
 
 
 # Each omic's own feature-feature correlation graph (self_masks[name]).
@@ -625,70 +672,141 @@ debuginfoStr('Build Graph finished') # Print verbose
 
 
 ################################################################
-#   
-# SUBGRAPHS SAMPLING FOR TRAINING
+#
+# HELD-OUT SAMPLE SPLIT (train / validation / test)
 #
 ################################################################
+# The split is made over SAMPLES, stratified by CONDITION, before any training job is
+# drawn. Training subgraphs only ever contain training samples; validation and test
+# samples are never seen by the loss or the optimizer. Their labels are used only to
+# score the model.
+#
+# The unsupervised preprocessing above (the autoencoders and the KNN/correlation masks)
+# is still fitted on every sample's omic values, without labels. This is the
+# transductive setting usual for graph models. Held-out samples also send no messages
+# (there are no sample->feature or sample->sample edges), so they cannot influence the
+# representation of any other node.
 
-#start = timer()
-print("Start sampling!")
-np.random.seed(seed)
-jobs = []
-sample_num=round(encoded2_samples.shape[0]/3)
-omic_sizes = {name: max(1, int((encoded[name].shape[0]*OMIC_RATE[name])/args.n_batch)) for name in OMIC_NAMES} # Sets the number of features per omic in subgraph
-print(f'sample_num: {sample_num}, omic_sizes: {omic_sizes}')
-for _ in range(args.n_batch): # Iterates over subsampling
-    p = sub_sample_generic(graph,
-                            cross_sample_masks,
-                            self_masks,
-                            sample_mask,
-                            cross_omic_masks,
-                            OMIC_NAMES,
-                            sample_num,
-                            omic_sizes,
-                            encoded2_samples.shape[0],
-                            topology=TOPOLOGY) # Sub-graphs sampling as jobs to learn from in HGT
-    jobs.append(p)
+def stratified_sample_split(int_labels, val_ratio, test_ratio, rng):
+    """Per class: shuffle, then take round(ratio * n_c) samples (at least 1 when the
+    ratio is > 0) for test and for validation; the rest go to training. A class with
+    fewer than 3 samples cannot be represented in all three sets, so it goes to
+    training entirely (with a warning)."""
+    train, val, test = [], [], []
+    for c in np.unique(int_labels):
+        idx = np.where(int_labels == c)[0]
+        rng.shuffle(idx)
+        if len(idx) < 3 and (val_ratio > 0 or test_ratio > 0):
+            print(f"WARNING: class {label_encoder.classes_[c]!r} has only {len(idx)} sample(s); "
+                  f"all of them go to training and the class is absent from validation/test.")
+            train.extend(idx)
+            continue
+        n_test = max(1, int(round(test_ratio * len(idx)))) if test_ratio > 0 else 0
+        n_val = max(1, int(round(val_ratio * len(idx)))) if val_ratio > 0 else 0
+        if len(idx) - n_test - n_val < 1:
+            raise SystemExit(f"Class {label_encoder.classes_[c]!r} ({len(idx)} samples) leaves no training "
+                             f"samples with --val_ratio {val_ratio} / --test_ratio {test_ratio}.")
+        test.extend(idx[:n_test])
+        val.extend(idx[n_test:n_test + n_val])
+        train.extend(idx[n_test + n_val:])
+    return np.sort(train), np.sort(val), np.sort(test)
+
+train_idx, val_idx, test_idx = stratified_sample_split(
+    integer_labels, args.val_ratio, args.test_ratio, np.random.RandomState(seed))
+sample_split = np.full(len(common_samples), 'train', dtype=object)
+sample_split[val_idx] = 'val'
+sample_split[test_idx] = 'test'
+pd.DataFrame({'ID': common_samples, 'CONDITION': metadata['CONDITION'].values, 'split': sample_split}) \
+    .to_csv(model_dir + 'sample_split.csv', index=False)
+print(f"Sample split (stratified by CONDITION): train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)} "
+      f"-> {model_dir}sample_split.csv")
+if len(test_idx) == 0:
+    print("WARNING: no held-out test samples (--test_ratio 0 or classes too small). The reported "
+          "metrics will be computed on TRAINING samples and are not an estimate of generalization.")
 
 
-print("Sampling end!")
-debuginfoStr('Cell Graph constructed and pruned')
+################################################################
+#
+# ONE GRAPH BUILDER FOR TRAINING, VALIDATION AND INFERENCE
+#
+################################################################
+# Every graph the model ever sees is "the whole feature graph + a subset of sample
+# nodes": training jobs (random training samples), the validation graph (validation
+# samples) and the inference batches (all samples). Every feature node and every
+# feature->feature edge is always present. Sample nodes only receive messages. So
+# each node's neighbourhood, and therefore each softmax over incoming edges, is the
+# same during training and inference. (Previously each training job kept only about
+# 1/n_batch of the features, the top ones by degree, while inference used them all.)
+edge_dict = {e[2]: i for i, e in enumerate(graph.get_meta_graph())} # relation name -> relation id
+edge_dict['self'] = len(edge_dict) # reserved 'self' relation id
 
-# Split jobs into train, validation, and test sets
-#train_ratio, val_ratio, test_ratio = 0.7, 0.15, 0.15
-#n_jobs = len(jobs)
-#n_train = int(n_jobs * train_ratio)
-#n_val = int(n_jobs * val_ratio)
-#n_test = n_jobs - n_train - n_val
-#random.shuffle(jobs)
-#train_jobs = jobs[:n_train]
-#val_jobs = jobs[n_train:n_train + n_val]
-#test_jobs = jobs[n_train + n_val:]
-#print(f"Train jobs: {len(train_jobs)}, Val jobs: {len(val_jobs)}, Test jobs: {len(test_jobs)}")
-train_ratio, val_ratio, test_ratio = 0.7, 0.15, 0.15
-n_jobs = len(jobs)
-random.shuffle(jobs)
+OMIC_FEATURE_OFFSETS = {}
+_off = 0
+for _name in OMIC_NAMES:
+    OMIC_FEATURE_OFFSETS[_name] = _off
+    _off += encoded[_name].shape[0]
+n_feature_nodes = _off  # all omic features come before the samples in the global node index
 
-if n_jobs >= 3:
-    n_val = max(1, int(n_jobs * val_ratio))
-    n_test = max(1, int(n_jobs * test_ratio))
-    n_train = n_jobs - n_val - n_test
-else:
-    # Too few sub-sampled jobs to hold out anything meaningfully;
-    # reuse the training jobs for validation/test rather than leaving them empty.
-    n_train = n_jobs
-    n_val = 0
-    n_test = 0
+# Feature-only part (feature nodes + feature->feature edges): built once, shared by every graph.
+_feat_x, _feat_node_type, _, _feat_edge_index, _feat_edge_type = build_data_generic(
+    {**{name: encoded[name].detach().numpy() for name in OMIC_NAMES},
+     'sample': np.zeros((0, encoded2_samples.shape[1]), dtype=np.float32)},
+    {name: cross_sample_masks[name][:, :0] for name in OMIC_NAMES},
+    self_masks, sample_mask[:0, :0], cross_omic_masks, OMIC_NAMES, edge_dict)
+FEATURE_X = torch.cat([_feat_x[name] for name in OMIC_NAMES], 0)
+FEATURE_NODE_TYPE = _feat_node_type
+FEATURE_EDGE_INDEX = _feat_edge_index
+FEATURE_EDGE_TYPE = _feat_edge_type
+del _feat_x, _feat_node_type, _feat_edge_index, _feat_edge_type
+SAMPLE_X = encoded2_samples.detach().float().cpu()
+_sample_rel = relation_name('sample', 'sample')
 
-train_jobs = jobs[:n_train]
-val_jobs = jobs[n_train:n_train + n_val] if n_val > 0 else train_jobs
-test_jobs = jobs[n_train + n_val:] if n_test > 0 else train_jobs
-print(f"Train jobs: {len(train_jobs)}, Val jobs: {len(val_jobs)}, Test jobs: {len(test_jobs)}")
+def build_sample_subgraph(sample_idx):
+    """All feature nodes and feature->feature edges plus the samples in `sample_idx`.
+    Node order: features (global index), then the given samples in the given order
+    (local sample k = global sample sample_idx[k]). Returns CPU tensors
+    (x, node_type, edge_time, edge_index, edge_type)."""
+    sample_idx = np.asarray(sample_idx, dtype=np.int64)
+    n_s = len(sample_idx)
+    ei_parts = [FEATURE_EDGE_INDEX.numpy()]
+    et_parts = [FEATURE_EDGE_TYPE.numpy()]
+    for name in OMIC_NAMES:  # omic feature -> sample edges
+        o_idx, s_idx = np.nonzero(cross_sample_masks[name][:, sample_idx])
+        ei_parts.append(np.stack([o_idx + OMIC_FEATURE_OFFSETS[name], s_idx + n_feature_nodes]))
+        et_parts.append(np.full(o_idx.shape[0], edge_dict[relation_name(name, 'sample')]))
+    i_s, j_s = np.nonzero(sample_mask[np.ix_(sample_idx, sample_idx)])  # sample -> sample edges
+    ei_parts.append(np.stack([i_s + n_feature_nodes, j_s + n_feature_nodes]))
+    et_parts.append(np.full(i_s.shape[0], edge_dict[_sample_rel]))
+    edge_index = torch.LongTensor(np.concatenate(ei_parts, axis=1))
+    edge_type = torch.LongTensor(np.concatenate(et_parts))
+    edge_time = torch.zeros(edge_type.shape[0], dtype=torch.long)
+    x = torch.cat([FEATURE_X, SAMPLE_X[torch.as_tensor(sample_idx)]], 0)
+    node_type = torch.cat([FEATURE_NODE_TYPE, torch.full((n_s,), len(OMIC_NAMES), dtype=torch.long)])
+    return x, node_type, edge_time, edge_index, edge_type
+
+
+################################################################
+#
+# TRAINING SUBGRAPHS (DeepMAPS-style, training samples only)
+#
+################################################################
+# --n_batch subgraphs, each holding a random third of the TRAINING samples (at least 2,
+# so the cosine loss has a pair) plus the whole feature graph. Drawn once, reused every
+# epoch, from a dedicated seeded RNG (so --resume redraws exactly the same jobs).
+if any(OMIC_RATE[name] != 1.0 for name in OMIC_NAMES):
+    print(f"NOTE: per-omic `rate` ({OMIC_RATE}) is ignored. Training subgraphs always keep every "
+          f"feature, so the graph seen in training matches the one used at inference.")
+sample_num = int(min(len(train_idx), max(2, round(len(train_idx) / 3))))
+_job_rng = np.random.RandomState(seed + 1)
+train_jobs = [np.sort(_job_rng.choice(train_idx, sample_num, replace=False)) for _ in range(args.n_batch)]
+_covered = len(np.unique(np.concatenate(train_jobs)))
+print(f"Training subgraphs: {len(train_jobs)} x {sample_num} training samples (+ all {n_feature_nodes} "
+      f"feature nodes); {_covered}/{len(train_idx)} training samples covered.")
 
 
 ################################################################
 #   
-# SUBGRAPHS SAMPLING FOR TRAINING
+# MODEL
 #
 ################################################################
 #args.n_heads = 8
@@ -735,7 +853,6 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 start = timer()
 gnn.train() # The GNN arquitecture. It shows the layers and dimensions.
 training_loss = []
-kl_losses_history = {name: [] for name in OMIC_NAMES}
 cross_entropy_losses = []
 cosine_losses = []
 total_losses = []
@@ -744,9 +861,11 @@ lr_history = []
 
 cosine_loss_fn = nn.CosineEmbeddingLoss(margin=0.5, reduction='sum').to(device)  # Initialize CosineEmbeddingLoss
 
-patience = 50
-patience_counter = 0
+# Best-epoch selection: the model used for inference/interpretability is the one from
+# the epoch with the lowest validation loss (held-out validation samples). With no
+# validation samples, the final epoch is used.
 best_val_loss = float('inf')
+best_epoch = None          # 0-based epoch index of best_model_state
 best_model_state = None
 
 ################################################################
@@ -772,10 +891,20 @@ if args.resume:
         start_epoch = checkpoint['epoch'] + 1
         total_losses = checkpoint.get('total_losses', [])
         val_losses = checkpoint.get('val_losses', [])
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        best_epoch = checkpoint.get('best_epoch')
+        best_model_state = checkpoint.get('best_model_state_dict')
         cosine_losses = checkpoint.get('cosine_losses', [])
         cross_entropy_losses = checkpoint.get('cross_entropy_losses', [])
-        kl_losses_history = checkpoint.get('kl_losses_history', {name: [] for name in OMIC_NAMES})
         lr_history = checkpoint.get('lr_history', [])
+        _ckpt_split = checkpoint.get('sample_split')
+        _this_split = {'train': [common_samples[k] for k in train_idx],
+                       'val': [common_samples[k] for k in val_idx],
+                       'test': [common_samples[k] for k in test_idx]}
+        if _ckpt_split is None or _ckpt_split != _this_split:
+            raise SystemExit("--resume: the checkpoint was trained on a different (or unrecorded) "
+                             "train/val/test sample split - resuming would leak held-out samples into "
+                             "training. Start a fresh run instead.")
         random.setstate(checkpoint['random_state'])
         np.random.set_state(checkpoint['numpy_random_state'])
         torch.set_rng_state(checkpoint['torch_random_state'])
@@ -799,10 +928,15 @@ def save_checkpoint(current_epoch):
         'scheduler_state_dict': scheduler.state_dict(),
         'total_losses': total_losses,
         'val_losses': val_losses,
+        'best_val_loss': best_val_loss,
+        'best_epoch': best_epoch,
+        'best_model_state_dict': best_model_state,
         'cosine_losses': cosine_losses,
         'cross_entropy_losses': cross_entropy_losses,
-        'kl_losses_history': kl_losses_history,
         'lr_history': lr_history,
+        'sample_split': {'train': [common_samples[k] for k in train_idx],
+                         'val': [common_samples[k] for k in val_idx],
+                         'test': [common_samples[k] for k in test_idx]},
         'random_state': random.getstate(),
         'numpy_random_state': np.random.get_state(),
         'torch_random_state': torch.get_rng_state(),
@@ -810,331 +944,106 @@ def save_checkpoint(current_epoch):
     }, checkpoint_path)
 
 
-for epoch in np.arange(start_epoch, args.epoch): # Iterates over the epochs. Number set to 100.
-    L = 0 # Initialization
-    #check = 0
+def compute_loss(class_rep, sample_matrix, samples_labels):
+    """Training objective, shared by training and validation:
+    0.3 * cross-entropy + 0.7 * cosine-embedding loss over sample pairs
+    (same class -> similar embeddings, different class -> dissimilar).
+    Returns (loss, ce_loss, cosine_loss)."""
+    ce_loss = F.cross_entropy(class_rep, torch.FloatTensor(samples_labels).to(device))
+    num_samples = sample_matrix.shape[0]
+    max_pairs = 1000  # Limit pairs to avoid O(n^2) computation
+    sample_idx_i = []
+    sample_idx_j = []
+    targets = []
+    sample_classes = torch.argmax(torch.LongTensor(samples_labels), dim=1)
+    # Positive pairs (same class)
+    for cls in torch.unique(sample_classes):
+        cls_idx = torch.where(sample_classes == cls)[0]
+        if len(cls_idx) >= 2:  # Need at least 2 samples for pairs
+            pairs = torch.combinations(cls_idx, r=2)
+            sample_idx_i.extend(pairs[:, 0].tolist())
+            sample_idx_j.extend(pairs[:, 1].tolist())
+            targets.extend([1] * len(pairs))
+    # Negative pairs (different classes)
+    for i in range(num_samples):
+        for j in range(i + 1, num_samples):
+            if sample_classes[i] != sample_classes[j]:
+                sample_idx_i.append(i)
+                sample_idx_j.append(j)
+                targets.append(-1)
+    # Limit total pairs
+    if len(sample_idx_i) > max_pairs:
+        idx = torch.randperm(len(sample_idx_i))[:max_pairs]
+        sample_idx_i = [sample_idx_i[i] for i in idx]
+        sample_idx_j = [sample_idx_j[i] for i in idx]
+        targets = [targets[i] for i in idx]
+    if len(sample_idx_i) > 0:
+        target_tensor = torch.tensor(targets, dtype=torch.float32, device=device)
+        cosine_loss = cosine_loss_fn(sample_matrix[sample_idx_i], sample_matrix[sample_idx_j], target_tensor)
+    else:
+        cosine_loss = torch.tensor(0.0, device=device)
+    loss = 0.3 * ce_loss + 0.7 * cosine_loss
+    return loss, ce_loss, cosine_loss
+
+
+def forward_on_samples(sample_idx):
+    """Runs the HGT on build_sample_subgraph(sample_idx). Returns
+    (node_rep, class_rep, sample_matrix) - class_rep/sample_matrix rows follow sample_idx."""
+    x, node_type, edge_time, edge_index, edge_type = build_sample_subgraph(sample_idx)
+    node_type = node_type.to(device)
+    node_rep, class_rep, g_32, g_64, g_128 = gnn.forward(
+        x.to(device), node_type, edge_time.to(device), edge_index.to(device), edge_type.to(device))
+    return node_rep, class_rep, node_rep[node_type == len(OMIC_NAMES), ]
+
+
+for epoch in np.arange(start_epoch, args.epoch): # Iterates over the epochs
+    # Training: one optimizer step per training subgraph. The logged values are the
+    # MEANS over this epoch's subgraphs (previously: the last batch's total loss, and
+    # CE/cosine values that the validation pass had overwritten).
     gnn.train()
-    for job in train_jobs: # Iterates over the graph-subsampling generated in the preprocessing
-        #print(check)
-        feature,time,edge_list,indxs = job # Initialize the job. Sets feature (cells and genes), time (time dealing in transformers), edges (connections) and indeces (no idea).
-        node_dict = {} # Initialization
-        node_feature = [] # Initialization
-        node_type = [] # Initialization
-        node_time = [] # Initialization
-        edge_index = [] # Initialization
-        edge_type = [] # Initialization
-        edge_time = [] # Initialization
-        
-        node_num = 0 # Initialization
-        types = graph.get_types()   # ['gene','cell']
-        for t in types: # Iterates over genes and cells
-            node_dict[t] = [node_num, len(node_dict)] # Creates a dictionary of cells and genes
-            node_num += len(feature[t])
-                # node_dict: {'gene':[0,0],'cell':[134,1]}
-                 
-        for t in types: # Iterates over genes and cellsc
-            t_i = node_dict[t][1]
-            node_feature.insert(t_i, torch.tensor(feature[t], dtype=torch.float32).to(device)) # Saves cells or genes matrices  
-            node_time += list(time[t]) # Saves node time
-            node_type += [node_dict[t][1] for _ in range(len(feature[t]))] # Saves node type
-             
-        edge_dict = {e[2]: i for i, e in enumerate(graph.get_meta_graph())} # Reference dictionary of connections
-        edge_dict['self'] = len(edge_dict) # Incoporates self lenght parameter to edge dictionary
-        # {'g_c': 0, 'rev_g_c': 1 ,'self': 2}
-        for target_type in edge_list:
-            for source_type in edge_list[target_type]:
-                for relation_type in edge_list[target_type][source_type]:
-                    for ii, (ti, si) in enumerate(edge_list[target_type][source_type][relation_type]):
-                        tid, sid = ti + \
-                            node_dict[target_type][0], si + \
-                            node_dict[source_type][0]
-                        edge_index += [[sid, tid]]
-                        edge_type += [edge_dict[relation_type]]
-                        edge_time += [120]
-                            
-                        
-                    
-                
-        node_feature = torch.cat(node_feature, 0) # Nodes features matrix in tensor format (N omics + samples, in type-index order)
-        node_type = torch.LongTensor(node_type) # Nodes type matrix in tensor format
-        edge_time = torch.LongTensor(edge_time) # Edges time matrix in tensor format (all the same)
-        edge_index = torch.LongTensor(edge_index).t() # Edges indexes (nodes-nodes connections) in tensor format
-        #edge_index[1][np.array(edge_type) == edge_dict['g_g']] = edge_index[1][np.array(edge_type) == edge_dict['g_g']]-node_dict['sample'][0]
-        #edge_index[0][np.array(edge_type) == edge_dict['rev_g_g']] = edge_index[0][np.array(edge_type) == edge_dict['rev_g_g']]-node_dict['sample'][0]
-        #edge_index[1][np.array(edge_type) == edge_dict['s_s']] = edge_index[1][np.array(edge_type) == edge_dict['s_s']]+node_dict['sample'][0]+node_dict['metabolite'][0]
-        #edge_index[0][np.array(edge_type) == edge_dict['rev_s_s']] = edge_index[0][np.array(edge_type) == edge_dict['rev_s_s']]+node_dict['sample'][0]+node_dict['metabolite'][0]
-        #edge_index[1][np.array(edge_type) == edge_dict['m_m']] = edge_index[1][np.array(edge_type) == edge_dict['m_m']]+node_dict['metabolite'][0]
-        #edge_index[0][np.array(edge_type) == edge_dict['rev_m_m']] = edge_index[0][np.array(edge_type) == edge_dict['rev_m_m']]+node_dict['metabolite'][0]
-        edge_type = torch.LongTensor(edge_type) # Edges type in tensor format
-        #node_rep, cell_class = gnn.forward(node_feature, 
-        node_rep, class_rep, g_32, g_64, g_128 = gnn.forward(node_feature,node_type.to(device),edge_time.to(device),edge_index.to(device),edge_type.to(device)) # Applies HGT to obtain nodes representations
-            #if args.rep == 'T':
-                #node_rep = torch.trunc(node_rep*10000000000)/10000000000 # NO IDEA.
-                #if args.reduction == 'raw':
-                #    for t in types:
-                #        t_i = node_dict[t][1]
-                #       print("t_i="+str(t_i))
-                #        node_decoded_embedding[t_i] = torch.trunc(
-                #            node_decoded_embedding[t_i]*10000000000)/10000000000
-        omic_reps = {name: node_rep[node_type == i, ] for i, name in enumerate(OMIC_NAMES)} # Extracts each omic's node representations
-        sample_matrix = node_rep[node_type == len(OMIC_NAMES), ]
-        regularization_loss = 0 # Initialization of regularization loss
-        for param in gnn.parameters():
-            regularization_loss += torch.sum(torch.pow(param, 2)) # Saves the regularization loss over parameters
-                
-        if (args.loss == "sup"): # No other option
-            decoders = {name: torch.mm(sample_matrix, omic_reps[name].t()) for name in OMIC_NAMES}
-            adj = samples_stacked.T[indxs['sample'], ] # Extracts every omic's feature columns for the sampled samples
-            omic_offsets = {}
-            _off = 0
-            for name in OMIC_NAMES:
-                omic_offsets[name] = _off
-                _off += encoded[name].shape[0]
-            indexes = np.concatenate([indxs[name] + omic_offsets[name] for name in OMIC_NAMES])
-            adj_per_omic = {name: torch.tensor(adj[:, indxs[name] + omic_offsets[name]], dtype=torch.float32).to(device)
-                            for name in OMIC_NAMES} # per-omic columns are offset past every earlier omic's columns in `adj`
-            adj = adj[:, indexes] # Extracts every sampled omic feature's column, in omic order
-            adj = torch.tensor(adj, dtype=torch.float32).to(device) # Sets an adjacency matrix
-            samples_labels = one_hot_labels[indxs['sample'], ]
-            #samples_labels = one_hot_labels[node_type == 2, ]
-            #cells_labels = patient_loss[indxs['cell'],:]
-            if args.reduction == 'raw':
-                if epoch % 2 == 0:
-                    loss = F.kl_div(decoder.softmax(
-                        dim=-1).log(), adj.softmax(dim=-1), reduction='sum')+args.rf*regularization_loss
-                else:
-                    loss = nn.MSELoss()(
-                        node_feature[0], node_decoded_embedding[0])+args.rf*regularization_loss
-                    for t_i in range(1, len(types)):
-                        loss += nn.MSELoss()(node_feature[t_i],
-                                                    node_decoded_embedding[t_i])
-                            
-                        
-            else:
-                #loss = F.kl_div(decoder_g.softmax(dim=-1).log(), adj_g.softmax(dim=-1), reduction='sum')
-                #loss += F.kl_div(decoder_m.softmax(dim=-1).log(),adj_m.softmax(dim=-1), reduction='sum') # Calculates loss function based in KL divergence
-                #loss += F.cross_entropy(class_rep.softmax(dim=-1),torch.FloatTensor(samples_labels).to(device))
-                kl_losses = {name: F.kl_div(decoders[name].softmax(dim=-1).log(), adj_per_omic[name].softmax(dim=-1), reduction='sum')
-                             for name in OMIC_NAMES}
-                ce_loss = F.cross_entropy(class_rep,torch.FloatTensor(samples_labels).to(device))
-                #loss = 0.2*kl_gene + 0.2*kl_metabo + 0.6*ce_loss
-                #loss = kl_gene + kl_metabo + ce_loss
-                #loss += F.kl_div(cell_class.softmax(dim=-1).log(),torch.FloatTensor(cells_labels).to(device).softmax(dim=-1), reduction='sum')
-                # Compute CosineEmbeddingLoss for sample-sample pairs
-                num_samples = sample_matrix.shape[0]
-                max_pairs = 1000  # Limit pairs to avoid O(n^2) computation
-                sample_idx_i = []
-                sample_idx_j = []
-                targets = []
-                
-                # Assume samples_labels is one-hot; convert to class indices
-                sample_classes = torch.argmax(torch.LongTensor(samples_labels), dim=1)
-                
-                # Sample positive pairs (same class)
-                for cls in torch.unique(sample_classes):
-                    cls_idx = torch.where(sample_classes == cls)[0]
-                    if len(cls_idx) >= 2:  # Need at least 2 samples for pairs
-                        pairs = torch.combinations(cls_idx, r=2)
-                        sample_idx_i.extend(pairs[:, 0].tolist())
-                        sample_idx_j.extend(pairs[:, 1].tolist())
-                        targets.extend([1] * len(pairs))
-                    
-                # Sample negative pairs (different classes)
-                for i in range(num_samples):
-                    for j in range(i + 1, num_samples):
-                        if sample_classes[i] != sample_classes[j]:
-                            sample_idx_i.append(i)
-                            sample_idx_j.append(j)
-                            targets.append(-1)
-                
-                # Limit total pairs
-                if len(sample_idx_i) > max_pairs:
-                    idx = torch.randperm(len(sample_idx_i))[:max_pairs]
-                    sample_idx_i = [sample_idx_i[i] for i in idx]
-                    sample_idx_j = [sample_idx_j[i] for i in idx]
-                    targets = [targets[i] for i in idx]
-                    
-                if len(sample_idx_i) > 0:
-                    sample_emb_i = sample_matrix[sample_idx_i]
-                    sample_emb_j = sample_matrix[sample_idx_j]
-                    target_tensor = torch.tensor(targets, dtype=torch.float32, device=device)
-                    cosine_loss = cosine_loss_fn(sample_emb_i, sample_emb_j, target_tensor)
-                else:
-                    cosine_loss = torch.tensor(0.0, device=device)
-                    
-                #loss = 0.1 * kl_gene + 0.1 * kl_metabo + 0.4 * ce_loss + 0.4 * cosine_loss
-                loss = 0.3 * ce_loss + 0.7 * cosine_loss
-                
-        L += loss.item() # Saves loss 
+    L, L_ce, L_cos = 0.0, 0.0, 0.0
+    for job_idx in train_jobs:
+        node_rep, class_rep, sample_matrix = forward_on_samples(job_idx)
+        loss, ce_loss, cosine_loss = compute_loss(class_rep, sample_matrix, one_hot_labels[job_idx, ])
+        L += loss.item()
+        L_ce += ce_loss.item()
+        L_cos += cosine_loss.item()
         optimizer.zero_grad() # Initializies optimizer
         loss.backward() # Sets backpropagation to loss function
         optimizer.step() # Sets a step in optimizer
-        #check += 1
-        
-    scheduler.step(L/(int(len(train_jobs))))
+    printed_train_loss = L / len(train_jobs)
+    scheduler.step(printed_train_loss)
     lr_history.append(optimizer.param_groups[0]['lr'])
-        # Validation phase
+
+    # Validation: one forward pass over the held-out validation samples (same graph
+    # construction as training/inference), no gradient.
     gnn.eval()
-    val_L = 0
-    with torch.no_grad():
-        for job in val_jobs:
-            feature, time, edge_list, indxs = job
-            node_dict = {}
-            node_feature = []
-            node_type = []
-            node_time = []
-            edge_index = []
-            edge_type = []
-            edge_time = []
-            
-            node_num = 0
-            types = graph.get_types()
-            for t in types:
-                node_dict[t] = [node_num, len(node_dict)]
-                node_num += len(feature[t])
-                
-            for t in types:
-                t_i = node_dict[t][1]
-                node_feature.insert(t_i, torch.tensor(feature[t], dtype=torch.float32).to(device))
-                node_time += list(time[t])
-                node_type += [node_dict[t][1] for _ in range(len(feature[t]))]
-                
-            edge_dict = {e[2]: i for i, e in enumerate(graph.get_meta_graph())}
-            edge_dict['self'] = len(edge_dict)
-            for target_type in edge_list:
-                for source_type in edge_list[target_type]:
-                    for relation_type in edge_list[target_type][source_type]:
-                        for ii, (ti, si) in enumerate(edge_list[target_type][source_type][relation_type]):
-                            tid, sid = ti + node_dict[target_type][0], si + node_dict[source_type][0]
-                            edge_index += [[sid, tid]]
-                            edge_type += [edge_dict[relation_type]]
-                            edge_time += [120]
-                            
-            node_feature = torch.cat(node_feature, 0) # Nodes features matrix in tensor format (N omics + samples, in type-index order)
-            node_type = torch.LongTensor(node_type).to(device)
-            edge_time = torch.LongTensor(edge_time).to(device)
-            edge_index = torch.LongTensor(edge_index).t().to(device)
-            edge_type = torch.LongTensor(edge_type).to(device)
-            node_rep, class_rep, g_32, g_64, g_128 = gnn.forward(
-                node_feature, node_type, edge_time, edge_index, edge_type
-            )
-            omic_reps = {name: node_rep[node_type == i, :] for i, name in enumerate(OMIC_NAMES)}
-            sample_matrix = node_rep[node_type == len(OMIC_NAMES), :]
-            regularization_loss = 0
-            for param in gnn.parameters():
-                regularization_loss += torch.sum(torch.pow(param, 2))
-                
-            if args.loss == "sup":
-                decoders = {name: torch.mm(sample_matrix, omic_reps[name].t()) for name in OMIC_NAMES}
-                adj = samples_stacked.T[indxs['sample'], :] # Extracts every omic's feature columns for the sampled samples
-                omic_offsets = {}
-                _off = 0
-                for name in OMIC_NAMES:
-                    omic_offsets[name] = _off
-                    _off += encoded[name].shape[0]
-                indexes = np.concatenate([indxs[name] + omic_offsets[name] for name in OMIC_NAMES])
-                adj_per_omic = {name: torch.tensor(adj[:, indxs[name] + omic_offsets[name]], dtype=torch.float32).to(device)
-                                for name in OMIC_NAMES} # per-omic columns are offset past every earlier omic's columns in `adj`
-                adj = adj[:, indexes] # Extracts every sampled omic feature's column, in omic order
-                adj = torch.tensor(adj, dtype=torch.float32).to(device)
-                samples_labels = one_hot_labels[indxs['sample'], :]
-                if args.reduction == 'raw':
-                    if epoch % 2 == 0:
-                        val_loss = F.kl_div(decoder.softmax(dim=-1).log(), adj.softmax(dim=-1), reduction='sum') + args.rf * regularization_loss
-                    else:
-                        val_loss = nn.MSELoss()(node_feature[0], node_decoded_embedding[0]) + args.rf * regularization_loss
-                        for t_i in range(1, len(types)):
-                            val_loss += nn.MSELoss()(node_feature[t_i], node_decoded_embedding[t_i])
-                else:
-                    kl_losses = {name: F.kl_div(decoders[name].softmax(dim=-1).log(), adj_per_omic[name].softmax(dim=-1), reduction='sum')
-                                 for name in OMIC_NAMES}
-                    ce_loss = F.cross_entropy(class_rep, torch.FloatTensor(samples_labels).to(device))
-                    num_samples = sample_matrix.shape[0]
-                    max_pairs = 1000
-                    sample_idx_i = []
-                    sample_idx_j = []
-                    targets = []
-                    sample_classes = torch.argmax(torch.FloatTensor(samples_labels).to(device), dim=1)
-                    for cls in torch.unique(sample_classes):
-                        cls_idx = torch.where(sample_classes == cls)[0]
-                        if len(cls_idx) >= 2:
-                            pairs = torch.combinations(cls_idx, r=2)
-                            sample_idx_i.extend(pairs[:, 0].tolist())
-                            sample_idx_j.extend(pairs[:, 1].tolist())
-                            targets.extend([1] * len(pairs))
-                            
-                    for i in range(num_samples):
-                        for j in range(i + 1, num_samples):
-                            if sample_classes[i] != sample_classes[j]:
-                                sample_idx_i.append(i)
-                                sample_idx_j.append(j)
-                                targets.append(-1)
-                                
-                    if len(sample_idx_i) > max_pairs:
-                        idx = torch.randperm(len(sample_idx_i))[:max_pairs]
-                        sample_idx_i = [sample_idx_i[i] for i in idx]
-                        sample_idx_j = [sample_idx_j[i] for i in idx]
-                        targets = [targets[i] for i in idx]
-                        
-                    if len(sample_idx_i) > 0:
-                        sample_emb_i = sample_matrix[sample_idx_i]
-                        sample_emb_j = sample_matrix[sample_idx_j]
-                        target_tensor = torch.tensor(targets, dtype=torch.float32, device=device)
-                        cosine_loss = cosine_loss_fn(sample_emb_i, sample_emb_j, target_tensor)
-                    else:
-                        cosine_loss = torch.tensor(0.0, device=device)
-                        
-                    #val_loss = 0.2 * kl_gene + 0.2 * kl_metabo + 0.3 * ce_loss + 0.3 * cosine_loss
-                    val_loss = 0.3 * ce_loss + 0.7 * cosine_loss
-                    
-                val_L += val_loss.item()
-    #print('Epoch :', epoch+1, '|', 'train_loss:%.12f' % (L/(int(len(jobs)))/args.n_batch)) # Print loss in epoch
-    #print('Epoch :', epoch+1, '|', 'train_loss:%.12f' % (L/(int(len(jobs))))) # Print loss in epoch
-    #val_loss=1
-    printed_val_loss = val_L/(int(len(val_jobs)))
-    printed_train_loss = L/(int(len(train_jobs)))
+    if len(val_idx) > 0:
+        with torch.no_grad():
+            node_rep, class_rep, sample_matrix = forward_on_samples(val_idx)
+            val_loss, _, _ = compute_loss(class_rep, sample_matrix, one_hot_labels[val_idx, ])
+        printed_val_loss = val_loss.item()
+    else:
+        printed_val_loss = float('nan')
     print(f'Epoch: {epoch+1} | Train Loss: {printed_train_loss:.12f}\nEpoch: {epoch+1} | Val Loss: {printed_val_loss:.12f}')
-    #training_loss.append((L/(int(samples.shape[0]))/args.n_batch))
-    for name in OMIC_NAMES:
-        kl_losses_history[name].append(kl_losses[name].item())
-    cross_entropy_losses.append(ce_loss.item())
-    cosine_losses.append(cosine_loss.item())  # Track cosine loss
-    total_losses.append(loss.item())
+    total_losses.append(printed_train_loss)
+    cross_entropy_losses.append(L_ce / len(train_jobs))
+    cosine_losses.append(L_cos / len(train_jobs))
     val_losses.append(printed_val_loss)
+
+    if np.isfinite(printed_val_loss) and printed_val_loss < best_val_loss:
+        best_val_loss = printed_val_loss
+        best_epoch = int(epoch)
+        best_model_state = {k: v.detach().cpu().clone() for k, v in gnn.state_dict().items()}
+        print(f"Epoch: {epoch+1} | new best validation loss {best_val_loss:.12f}")
 
     if (epoch + 1) % args.checkpoint_every == 0 or (epoch + 1) == args.epoch:
         save_checkpoint(epoch)
         print(f"Checkpoint saved at epoch {epoch + 1} -> {checkpoint_path}")
-    # Early stopping checks
-    #if cosine_loss.item() < 1e-6 and ce_loss.item() < 1e-6:
-    #    patience_counter += 1
-    #    print(f'Early stopping condition: cosine_loss ({cosine_loss.item():.6f}) and ce_loss ({ce_loss.item():.6f}) near zero')
-    #elif val_loss > loss:
-    #    patience_counter += 1
-    #    print(f'Early stopping condition: val_loss ({val_loss:.6f}) > train_loss ({loss:.6f})')
-    #else:
-    #    patience_counter = 0
-    #    best_val_loss = min(best_val_loss, val_loss)
-    #    best_model_state = gnn.state_dict()
-    #    state = {'model': gnn.state_dict(), 'optimizer': scheduler.state_dict(),
-    #    'epoch': epoch} # Saves a dictionary of model
-    #    model0=f'BiomiX_epoch_{args.epoch}_n_hid_{args.n_hid}_nheads_{args.n_heads}_lr_01_n_batch{args.n_batch}'
-    #    torch.save(state, model_dir+model0) # Saves model in folder
-    #    
-    #if patience_counter >= patience:
-    #    print(f'Early stopping triggered after {patience} epochs of no improvement')
-    #    gnn.load_state_dict(best_model_state)
-    #    break
-    
-
-    
-    
-
-
-
 end = timer()
 print(f"BiomiX-HGT took {round((end - start)/60,2)} mins to train")
-unique_vals, counts = torch.unique(edge_type, return_counts=True) # Count value repetitions
+_all_edge_type = build_sample_subgraph(np.arange(encoded2_samples.shape[0]))[4]  # edge types of the full graph
+unique_vals, counts = torch.unique(_all_edge_type, return_counts=True) # Count value repetitions
 count_dict = dict(zip(unique_vals.tolist(), counts.tolist())) # Combine into a dictionary (optional)
 print(f"Edge dict is:\n{edge_dict}\nAnd count dict is:\n{count_dict}")
 
@@ -1143,35 +1052,42 @@ print(f"Edge dict is:\n{edge_dict}\nAnd count dict is:\n{count_dict}")
 # Total/Validation loss carry the headline message (converging? overfitting?) so they
 # get bold, saturated lines; the two loss components are supporting detail, so they're
 # thin and muted to avoid competing for attention.
-fig, ax = plt.subplots(figsize=(9, 5.5))
-ax.plot(total_losses, label='Total Loss', color=OKABE_ITO[0], linewidth=2.5, zorder=3)
-ax.plot(val_losses, label='Validation Loss', color=OKABE_ITO[1], linewidth=2.5, zorder=3)
+fig, ax = plt.subplots(figsize=(6.5, 7.2))
+ax.plot(total_losses, label='Training Loss (epoch mean)', color=OKABE_ITO[0], linewidth=2.5, zorder=3)
+ax.plot(val_losses, label='Validation Loss (held-out samples)', color=OKABE_ITO[1], linewidth=2.5, zorder=3)
 ax.plot(cosine_losses, label='Cosine Loss (component)', color='#999999', linewidth=1.1, linestyle='--', zorder=2)
 ax.plot(cross_entropy_losses, label='Cross Entropy (component)', color='#bbbbbb', linewidth=1.1, linestyle=':', zorder=2)
 ax.set_xlabel('Epoch')
 ax.set_ylabel('Loss')
+if best_epoch is not None:
+    ax.axvline(best_epoch, color=OKABE_ITO[4], linestyle='--', linewidth=1.2,
+               label=f'Selected model (epoch {best_epoch + 1}, lowest val loss)')
 ax.set_title('Training Convergence')
-ax.legend(loc='upper right', fontsize=9)
+square_frame(ax)
+ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.13), ncol=2, fontsize=8)
 plt.tight_layout()
 plt.savefig(plots_dir+"training_loss_components.pdf")
 plt.close(fig)
 
 
-state = {'model': gnn.state_dict(), 'optimizer': scheduler.state_dict(),
-        'epoch': epoch} # Saves a dictionary of model
+if best_model_state is not None:
+    selected_state, selected_epoch = best_model_state, best_epoch
+    print(f"Model selection: using epoch {best_epoch + 1}/{len(val_losses)} "
+          f"(lowest validation loss = {best_val_loss:.12f}).")
+else:
+    selected_state, selected_epoch = gnn.state_dict(), len(total_losses) - 1
+    print("Model selection: no validation samples - using the final epoch.")
+state = {'model': selected_state, 'optimizer': scheduler.state_dict(),
+        'epoch': selected_epoch, 'best_val_loss': best_val_loss} # Saves a dictionary of model
 #model0=f'BiomiX_epoch_{args.epoch}_n_hid_{args.n_hid}_nheads_{args.n_heads}_lr_01_n_batch{args.n_batch}'
 model0 = f'BiomiX_n_hid_{args.n_hid}_nheads_{args.n_heads}_lr_01_n_batch{args.n_batch}'
 torch.save(state, model_dir+model0) # Saves model in folder
 pd.DataFrame(total_losses).to_csv(loss_dir+model0+"_total_losses.csv")
-#pd.DataFrame(kl_gene_losses).to_csv(loss_dir+model0+"_kl_gene_losses.csv")
-#pd.DataFrame(kl_metabo_losses).to_csv(loss_dir+model0+"_kl_metabo_losses.csv")
 pd.DataFrame(cosine_losses).to_csv(loss_dir+model0+"_cosine_losses.csv")
 pd.DataFrame(cross_entropy_losses).to_csv(loss_dir+model0+"_cross_entropy_losses.csv")
 pd.DataFrame(val_losses).to_csv(loss_dir+model0+"_val_losses.csv")
 debuginfoStr('Graph Autoencoder training finished')
 
-print(class_rep)
-print(torch.FloatTensor(samples_labels))
 
 
 
@@ -1187,117 +1103,264 @@ gnn.eval()
 
 # Determine batch size
 sample_len = samples_stacked.T.shape[0]
+# The trained model is applied to the FULL graph: all features + all samples. Up to
+# 10000 samples this is a single pass. Above that, samples are processed in batches of
+# 500 (memory only). This is mathematically identical to the single pass because samples
+# never send messages, and the merge below plus the guard in the loop keep it that way.
 if sample_len > 10000:
     ba = 500
 else:
     ba = sample_len
-    
 
-#if (gene_cell.shape[1]>10000):
-#        
-#        if (gene_cell.shape[0]>10000):
-#            ba = 500
-#        else:
-#            ba = gene_cell.shape[0]
-#    else:
-#        if (gene_cell.shape[0]>10000):
-#            ba = 5000
-#        else:
-#            ba = gene_cell.shape[0] # Adapts batch to data dimensions
+# ----------------------------------------------------------------------------------
+# Interpretability quantities extracted here (see README "Interpretability"):
+#
+#   alpha[e, l, h]  post-softmax attention of edge e = (j -> i) in HGT layer l, head h.
+#                   This is the weight the model actually uses (the old output was the
+#                   raw pre-softmax logit of layer 0 only, which is only defined up to a
+#                   per-target shift, so its sign/absolute value carried no meaning).
+#
+#   push_c(e, s)    sum_h alpha[e,l,h] * d z~_c(s) / d alpha[e,l,h]: signed attention x
+#                   gradient (in the spirit of Chefer et al., 2021) - how much edge e's
+#                   message moves sample s towards class c. z~_c(s) = z_c(s) - mean_k z_k(s)
+#                   is the centered class logit (the part of the logits the softmax
+#                   prediction depends on; unlike log p_c it does not saturate).
+#
+#   attr[e, l, c]     = mean of push_c over TRAINING samples OF class c   (on-class:
+#                       does the edge push class-c samples towards c?)
+#   attr_off[e, l, c] = mean of push_c over TRAINING samples NOT of class c (off-class:
+#                       does it also push the other samples towards c?)
+#   score[e, c]       = attr - max(attr_off, 0), both summed over layers: class-specific
+#                       evidence for c. A feature that pushes EVERY sample towards c (a
+#                       bias, not a discriminator) is penalized; one that pushes c-samples
+#                       towards c and leaves (or pushes away) the others keeps its score.
+#                       Binary case: attr_off_D = -attr_H, so score_D = attr_D + min(attr_H, 0).
+#   Only TRAINING samples are used, so programs/weights derived from these scores can be
+#   tested on the held-out test samples without double-dipping.
+#
+#   Node values = sums over the node's OUTGOING edges (the messages it sends) of attr and
+#   attr_off; the node score is then attr - max(attr_off, 0) on those sums.
+# ----------------------------------------------------------------------------------
+n_classes = one_hot_labels.shape[1]
+class_names = [str(c) for c in label_encoder.classes_]
+n_att_layers = len(gnn.gcs)
+n_total_nodes = n_feature_nodes + sample_len
+is_train_sample = np.zeros(sample_len, dtype=bool)
+is_train_sample[train_idx] = True
+class_counts = np.bincount(integer_labels[train_idx], minlength=n_classes)   # on-class denominators
+off_counts = len(train_idx) - class_counts                                  # off-class denominators
 
 sample_embedding = []
-omic_embedding = {name: [] for name in OMIC_NAMES}
-attention = []
-saliency = []
+omic_matrix = {}
 g32_embeddings = []
 g64_embeddings = []
 g128_embeddings = []
 class_embeddings = []
+# Per-batch edge records, stored with GLOBAL node indices so batches can be merged.
+edge_src_parts, edge_tgt_parts, edge_type_parts = [], [], []
+edge_alpha_parts = []  # [E_b, n_layers, n_heads]
+edge_attr_parts = []   # [E_b, n_layers, n_classes] on-class push (sum over the batch's training samples)
+edge_off_parts = []    # [E_b, n_layers, n_classes] off-class push (sum over the batch's training samples)
 
-node_features_full = {name: encoded[name].detach().numpy() for name in OMIC_NAMES}
-
-#with torch.no_grad():
-#with gnn.eval():
 for i in range(0, sample_len, ba):
-        # Sub-batch slice
-    sample_batch = samples_stacked.T[i:i+ba]
-
-        # Build (x, node_type, edge_time, edge_index, edge_type) for the fixed omic
-        # feature nodes plus this batch of sample nodes - the N-omic generalization
-        # of the original per-omic build_graph()/build_data() calls.
-    batch_node_features = dict(node_features_full)
-    batch_node_features['sample'] = encoded2_samples[i:i+ba, :].detach().numpy()
-    batch_cross_sample_masks = {name: cross_sample_masks[name][:, i:i+ba] for name in OMIC_NAMES}
-    batch_sample_mask = sample_mask[i:i+ba, i:i+ba]  # sub-mask for current batch
-
-    x, node_type, edge_time, edge_index, edge_type = build_data_generic(
-        batch_node_features,
-        batch_cross_sample_masks,
-        self_masks,
-        batch_sample_mask,
-        cross_omic_masks,
-        OMIC_NAMES,
-        edge_dict
-    )
+    # Same graph builder as the training subgraphs and the validation graph: the whole
+    # feature graph plus this batch of samples (global samples i .. i+ba-1).
+    x, node_type, edge_time, edge_index, edge_type = build_sample_subgraph(np.arange(i, min(i + ba, sample_len)))
 
     gnn.eval()
-    x = torch.cat([x[name] for name in OMIC_NAMES] + [x['sample']], 0) # Nodes features matrix in tensor format
-    x.requires_grad = True
-    node_rep, class_rep, g_32, g_64, g_128 = gnn.forward(x,
+    node_rep, class_rep, g_32, g_64, g_128 = gnn.forward(x.to(device),
                                     node_type.to(device),edge_time.to(device),
                                     edge_index.to(device), edge_type.to(device)) # Applies HGT
-    attention.append(gnn.att.detach().numpy()) # Saves attention
-    for _idx, _name in enumerate(OMIC_NAMES):
-        omic_embedding[_name].append(node_rep[node_type == _idx, ].detach().numpy()) # Extracts this omic's node representations
-    sample_matrix = node_rep[node_type == len(OMIC_NAMES), ]
-    sample_embedding.append(sample_matrix.detach().numpy())
-    # Choose a scalar objective for gradients
-    #score = class_rep.norm()  # or class_rep.mean() or a specific class prediction
-    #score.backward()
-    target = node_rep.mean() + class_rep.mean()
-    target.backward()
-    # Grab gradients
-    #saliency.append(x.grad.data.abs())  # [N, F] gradient magnitude
-    saliency.append(x.grad.abs().cpu().numpy())
-    g32_embeddings.append(g_32.detach().numpy())
-    g64_embeddings.append(g_64.detach().numpy())
-    g128_embeddings.append(g_128.detach().numpy())
-    class_embeddings.append(class_rep.detach().numpy())
-                    
+    alphas = gnn.att  # one post-softmax [E_b, n_heads] tensor per layer, still in the autograd graph
 
+    # Class-specific attention x gradient (see the block comment above the loop).
+    batch_labels = integer_labels[i:i+ba]
+    batch_train = is_train_sample[i:i+ba]
+    centered_logits = class_rep - class_rep.mean(dim=1, keepdim=True)
+    batch_attr = np.zeros((edge_index.shape[1], n_att_layers, n_classes), dtype=np.float64)
+    batch_off = np.zeros((edge_index.shape[1], n_att_layers, n_classes), dtype=np.float64)
+    for c in range(n_classes):
+        for sel, out in ((np.where(batch_train & (batch_labels == c))[0], batch_attr),   # on-class
+                         (np.where(batch_train & (batch_labels != c))[0], batch_off)):   # off-class
+            if len(sel) == 0:
+                continue
+            target_c = centered_logits[torch.as_tensor(sel, device=centered_logits.device), c].sum()
+            grads = torch.autograd.grad(target_c, alphas, retain_graph=True, allow_unused=True)
+            for l, (a, g) in enumerate(zip(alphas, grads)):
+                if g is not None:  # None = this layer's attention cannot reach the logits
+                    out[:, l, c] = (a * g).sum(dim=1).detach().cpu().numpy()
+
+    # Local -> global node index: feature nodes keep their index (same offsets in every
+    # batch); local sample k of this batch is global sample i + k.
+    src_local = edge_index[0].numpy()
+    tgt_local = edge_index[1].numpy()
+    edge_src_parts.append(np.where(src_local >= n_feature_nodes, src_local + i, src_local))
+    edge_tgt_parts.append(np.where(tgt_local >= n_feature_nodes, tgt_local + i, tgt_local))
+    edge_type_parts.append(edge_type.numpy())
+    edge_alpha_parts.append(np.stack([a.detach().cpu().numpy() for a in alphas], axis=1))
+    edge_attr_parts.append(batch_attr)
+    edge_off_parts.append(batch_off)
+
+    # Feature nodes only receive messages from other feature nodes, so their
+    # representations are identical in every batch: keep them once. (Appending them for
+    # every batch, as before, duplicated every omic embedding row per batch whenever
+    # there were > 10000 samples.)
+    if i == 0:
+        for _idx, _name in enumerate(OMIC_NAMES):
+            omic_matrix[_name] = node_rep[node_type.to(device) == _idx, ].detach().cpu().numpy()
+    else:
+        # Multi-batch guard: splitting the samples into batches is only exact because
+        # feature nodes never receive messages from samples, so every batch computes the
+        # same feature representations as the single full-graph pass. Verify it.
+        for _idx, _name in enumerate(OMIC_NAMES):
+            _rep_b = node_rep[node_type.to(device) == _idx, ].detach().cpu().numpy()
+            if not np.allclose(_rep_b, omic_matrix[_name], atol=1e-5):
+                raise RuntimeError("Multi-batch inference is not equivalent to the full graph "
+                                   f"({_name} representations differ between batches) - "
+                                   "a sample->feature or sample->sample edge must have been added.")
+    sample_embedding.append(node_rep[node_type.to(device) == len(OMIC_NAMES), ].detach().cpu().numpy())
+    g32_embeddings.append(g_32.detach().cpu().numpy())
+    g64_embeddings.append(g_64.detach().cpu().numpy())
+    g128_embeddings.append(g_128.detach().cpu().numpy())
+    class_embeddings.append(class_rep.detach().cpu().numpy())
 
 
 # SAVING RESULTS
 # np.vstack naturally handles a final partial batch, so there is no need to special-case
-# samples.shape[1] % ba != 0 (a previous version of this branch mixed up gene/metabo/sample
-# matrices when the batch size didn't evenly divide the sample count).
-omic_matrix = {name: np.vstack(omic_embedding[name]) for name in OMIC_NAMES}
+# samples.shape[1] % ba != 0.
 sample_matrix = np.vstack(sample_embedding)
-attention = np.vstack(attention)
-saliency = np.vstack(saliency)
 g32_embeddings = np.vstack(g32_embeddings)
 g64_embeddings = np.vstack(g64_embeddings)
 g128_embeddings = np.vstack(g128_embeddings)
 class_embeddings = np.vstack(class_embeddings)
 
+# Merge the per-batch edge records into one table over the whole graph. Feature->feature
+# edges appear once per batch: their alpha is identical in every batch (averaged here,
+# a no-op), while their attribution is summed, since each batch contributes the gradients
+# of its own samples' logits. Feature->sample edges appear in exactly one batch.
+_edge_src = np.concatenate(edge_src_parts).astype(np.int64)
+_edge_tgt = np.concatenate(edge_tgt_parts).astype(np.int64)
+_edge_type = np.concatenate(edge_type_parts)
+_edge_alpha = np.concatenate(edge_alpha_parts, axis=0)
+_edge_attr = np.concatenate(edge_attr_parts, axis=0)
+_edge_off = np.concatenate(edge_off_parts, axis=0)
+_keys = _edge_src * n_total_nodes + _edge_tgt
+_uniq_keys, _inv, _mult = np.unique(_keys, return_inverse=True, return_counts=True)
+n_edges = len(_uniq_keys)
+edge_src = _uniq_keys // n_total_nodes
+edge_tgt = _uniq_keys % n_total_nodes
+edge_rel = np.empty(n_edges, dtype=_edge_type.dtype)
+edge_rel[_inv] = _edge_type
+n_heads_att = _edge_alpha.shape[2]
+edge_alpha = np.zeros((n_edges, n_att_layers, n_heads_att))
+for _l in range(n_att_layers):
+    for _h in range(n_heads_att):
+        edge_alpha[:, _l, _h] = np.bincount(_inv, weights=_edge_alpha[:, _l, _h], minlength=n_edges) / _mult
+edge_attr = np.zeros((n_edges, n_att_layers, n_classes))
+edge_off = np.zeros((n_edges, n_att_layers, n_classes))
+for _l in range(n_att_layers):
+    for _c in range(n_classes):
+        edge_attr[:, _l, _c] = np.bincount(_inv, weights=_edge_attr[:, _l, _c], minlength=n_edges)
+        edge_off[:, _l, _c] = np.bincount(_inv, weights=_edge_off[:, _l, _c], minlength=n_edges)
+edge_attr /= np.maximum(class_counts, 1)[None, None, :]  # sum over class-c training samples -> mean
+edge_off /= np.maximum(off_counts, 1)[None, None, :]     # sum over other training samples -> mean
+del _edge_src, _edge_tgt, _edge_type, _edge_alpha, _edge_attr, _edge_off, _keys, _uniq_keys, _inv, _mult
 
-#cell_matrix = cell_matrix.detach().numpy()
+edge_attr_total = edge_attr.sum(axis=1)                    # [E, n_classes], summed over layers
+edge_off_total = edge_off.sum(axis=1)                      # [E, n_classes], summed over layers
+edge_score = edge_attr_total - np.maximum(edge_off_total, 0)   # [E, n_classes], class-specific evidence
+edge_attr_magnitude = np.abs(edge_attr_total).sum(axis=1)  # [E], class-agnostic strength (overview plots only)
+
+# Node-level metadata over the global node index (each omic's features in manifest
+# order, then the samples; OMIC_FEATURE_OFFSETS is defined with the graph builder) -
+# shared by every table/plot below.
+full_node_names = pd.concat(
+    [omic_dfs[name]['ID'].reset_index(drop=True) for name in OMIC_NAMES] + [pd.Series(common_samples)],
+    ignore_index=True
+)
+assert len(full_node_names) == n_total_nodes, "node name table does not match the graph's node count"
+node_type_names = np.concatenate(
+    [[_name] * encoded[_name].shape[0] for _name in OMIC_NAMES] + [['sample'] * sample_len]
+)
+rel_id_to_name = {v: k for k, v in edge_dict.items()}
+in_degree = np.bincount(edge_tgt, minlength=n_total_nodes)
+out_degree = np.bincount(edge_src, minlength=n_total_nodes)
+
+# Edge table (one row per directed edge j -> i of the whole graph).
+edge_table = {
+    'source': edge_src,
+    'target': edge_tgt,
+    'source_name': full_node_names.values[edge_src],
+    'target_name': full_node_names.values[edge_tgt],
+    'source_type': node_type_names[edge_src],
+    'target_type': node_type_names[edge_tgt],
+    'relation': [rel_id_to_name.get(r, str(r)) for r in edge_rel],
+    'target_in_degree': in_degree[edge_tgt],
+}
+for _l in range(n_att_layers):
+    for _h in range(n_heads_att):
+        edge_table[f'alpha_L{_l}_H{_h}'] = edge_alpha[:, _l, _h]
+for _l in range(n_att_layers):
+    _alpha_mean = edge_alpha[:, _l, :].mean(axis=1)
+    edge_table[f'alpha_mean_L{_l}'] = _alpha_mean
+    # log(alpha * in_degree): > 0 the target attends to this edge more than uniformly
+    # (alpha = 1/deg), < 0 less. Comparable across targets with different degrees.
+    edge_table[f'alpha_log_ratio_L{_l}'] = np.log(np.maximum(_alpha_mean * in_degree[edge_tgt], 1e-12))
+# Attention relative to uniform (alpha x in-degree; 1 = uniform), averaged over heads and layers.
+# Label-free and defined for every edge, including edges into validation/test samples: the
+# edge weight of the attention-network figures.
+edge_att_ratio = (edge_alpha.mean(axis=2) * in_degree[edge_tgt][:, None]).mean(axis=1)
+edge_table['attention_ratio'] = edge_att_ratio
+for _l in range(n_att_layers):
+    for _c, _cname in enumerate(class_names):
+        edge_table[f'attr_L{_l}_{_cname}'] = edge_attr[:, _l, _c]
+for _l in range(n_att_layers):
+    for _c, _cname in enumerate(class_names):
+        edge_table[f'attr_off_L{_l}_{_cname}'] = edge_off[:, _l, _c]
+for _c, _cname in enumerate(class_names):
+    edge_table[f'attr_{_cname}'] = edge_attr_total[:, _c]
+    edge_table[f'attr_off_{_cname}'] = edge_off_total[:, _c]
+    edge_table[f'score_{_cname}'] = edge_score[:, _c]
+edge_table['attr_magnitude'] = edge_attr_magnitude
+edge_df = pd.DataFrame(edge_table)
+edge_df.to_csv(att_dir+file0+".csv", sep=",", index=False)
+
+# Node table: node attribution = sum of its outgoing edges' attributions.
+node_attr = np.zeros((n_total_nodes, n_classes))
+node_off = np.zeros((n_total_nodes, n_classes))
+for _c in range(n_classes):
+    node_attr[:, _c] = np.bincount(edge_src, weights=edge_attr_total[:, _c], minlength=n_total_nodes)
+    node_off[:, _c] = np.bincount(edge_src, weights=edge_off_total[:, _c], minlength=n_total_nodes)
+node_score = node_attr - np.maximum(node_off, 0)      # class-specific evidence per node (programs)
+node_attr_magnitude = np.abs(node_attr).sum(axis=1)  # class-agnostic importance (overview plots only)
+node_table = {
+    'node': np.arange(n_total_nodes),
+    'node_name': full_node_names.values,
+    'node_type': node_type_names,
+    'out_degree': out_degree,
+    'in_degree': in_degree,
+}
+for _c, _cname in enumerate(class_names):
+    node_table[f'attr_{_cname}'] = node_attr[:, _c]
+    node_table[f'attr_off_{_cname}'] = node_off[:, _c]
+    node_table[f'score_{_cname}'] = node_score[:, _c]
+node_table['Attribution'] = node_attr_magnitude
+# The condition the node gives the most class-specific evidence for ('' if none is positive).
+node_table['Supported_class'] = np.where(
+    node_score.max(axis=1) > 0, np.array(class_names, dtype=object)[np.argmax(node_score, axis=1)], ''
+)
+node_df = pd.DataFrame(node_table)
+node_df.to_csv(att_dir+file0+"_node_attribution.csv", sep=",", index=False)
+print(f"Interpretability: {n_edges} edges x {n_att_layers} layers x {n_heads_att} heads extracted; "
+      f"{int((out_degree[:n_feature_nodes] == 0).sum())} feature nodes have no outgoing edge (attribution 0).")
+
 for name in OMIC_NAMES:
     np.savetxt(omic_dirs[name]+file0, omic_matrix[name], delimiter=' ')
 np.savetxt(sample_dir+file0, sample_matrix, delimiter=' ')
-#np.savetxt(embeddings_dir+file0, sample_matrix, delimiter=' ')
-positions = pd.DataFrame(edge_index.T)
-df = pd.DataFrame(attention)
-df2 = pd.concat([positions, df], axis=1)
-attention = df2
-#attention_save = np.concatenate([edge_index.T,attention],axis=1)
-#np.savetxt(att_dir+file0, attention_save, delimiter=' ')
-df2.to_csv(att_dir+file0+".csv",sep=",", index=True)
 np.savetxt(embbs_dir+"g128_embeddings", g128_embeddings, delimiter=' ')
 np.savetxt(embbs_dir+"g64_embeddings", g64_embeddings, delimiter=' ')
 np.savetxt(embbs_dir+"g32_embeddings", g32_embeddings, delimiter=' ')
 np.savetxt(embbs_dir+"class_embeddings", class_embeddings, delimiter=' ')
-#np.savetxt(embbs_dir+"node_embeddings", class_rep, delimiter=' ')
 
 
 
@@ -1307,64 +1370,82 @@ np.savetxt(embbs_dir+"class_embeddings", class_embeddings, delimiter=' ')
 #   
 ################################################################
 
-# Compute ROC-AUC and F1-Score
-#from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix
-# Convert class_embeddings to probabilities
-class_probs = F.softmax(torch.tensor(class_embeddings, dtype=torch.float32), dim=1).numpy()
-# Convert one_hot_labels to class indices
-true_labels = np.argmax(one_hot_labels, axis=1)
+# Metrics are computed per split (train / val / test) from the whole-graph inference
+# above. The headline numbers and figures (confusion matrix, ROC curves, per-class
+# performance) use the HELD-OUT TEST samples only. Train/val numbers are written next to
+# them in classification_metrics.csv for reference, plus 'all' (every sample together).
+# train and all are optimistic by construction (they include samples the model was fit on).
+class_probs_all = F.softmax(torch.tensor(class_embeddings, dtype=torch.float32), dim=1).numpy()
+n_classes = one_hot_labels.shape[1]
 
-# ROC-AUC
-try:
-    roc_auc = roc_auc_score(
-        y_true=one_hot_labels,
-        y_score=class_probs,
-        multi_class='ovr',
-        average='macro'
-    )
-    # Per-class ROC-AUC
-    roc_auc_per_class = {}
-    for i in range(one_hot_labels.shape[1]):
-        if np.sum(one_hot_labels[:, i]) > 0:  # Only compute for classes with samples
-            roc_auc_per_class[i] = roc_auc_score(
-                one_hot_labels[:, i],
-                class_probs[:, i]
-            )
-    print(f"ROC-AUC (macro): {roc_auc:.4f}")
-    print(f"Per-class ROC-AUC: {roc_auc_per_class}")
-except ValueError as e:
-    print(f"Error computing ROC-AUC: {e}")
-    roc_auc = 0.0
-    roc_auc_per_class = {}
+def split_metrics(idx):
+    y_true = integer_labels[idx]
+    probs = class_probs_all[idx]
+    y_pred = np.argmax(probs, axis=1)
+    out = {'n_samples': len(idx), 'accuracy': np.nan, 'f1_macro': np.nan, 'f1_weighted': np.nan,
+           'f1_micro': np.nan, 'roc_auc_macro': np.nan}
+    if len(idx) == 0:
+        return out
+    out['accuracy'] = float(np.mean(y_true == y_pred))
+    out['f1_macro'] = f1_score(y_true, y_pred, average='macro')
+    out['f1_weighted'] = f1_score(y_true, y_pred, average='weighted')
+    out['f1_micro'] = f1_score(y_true, y_pred, average='micro')
+    try:
+        if n_classes == 2:
+            out['roc_auc_macro'] = roc_auc_score(y_true, probs[:, 1])
+        else:
+            out['roc_auc_macro'] = roc_auc_score(one_hot_labels[idx], probs, multi_class='ovr', average='macro')
+    except ValueError as e:  # e.g. a class missing from a tiny split
+        print(f"ROC-AUC not computable on {len(idx)} samples: {e}")
+    return out
 
-# F1-Score
+metrics_rows = []
+for _split_name, _idx in (('train', train_idx), ('val', val_idx), ('test', test_idx),
+                          ('all', np.arange(len(common_samples)))):  # 'all' mixes training samples in: optimistic
+    _m = split_metrics(_idx)
+    metrics_rows.append({'split': _split_name, **_m})
+    print(f"[{_split_name}] n={_m['n_samples']} | accuracy={_m['accuracy']:.4f} | F1 macro={_m['f1_macro']:.4f} "
+          f"| ROC-AUC macro={_m['roc_auc_macro']:.4f}")
+pd.DataFrame(metrics_rows).to_csv(plots_dir + 'classification_metrics.csv', index=False)
+
+# Samples the headline figures are computed on.
+if len(test_idx) > 0:
+    eval_idx, eval_label = test_idx, f'held-out test samples (n={len(test_idx)})'
+else:
+    eval_idx, eval_label = train_idx, f'TRAINING samples (n={len(train_idx)}) - no held-out test set'
+eval_one_hot = one_hot_labels[eval_idx]
+class_probs = class_probs_all[eval_idx]
+true_labels = integer_labels[eval_idx]
 pred_labels = np.argmax(class_probs, axis=1)
-f1_macro = f1_score(true_labels, pred_labels, average='macro')
-f1_weighted = f1_score(true_labels, pred_labels, average='weighted')
-f1_micro = f1_score(true_labels, pred_labels, average='micro')
-print(f"F1-Score (macro): {f1_macro:.4f}, (weighted): {f1_weighted:.4f}, (micro): {f1_micro:.4f}")
-
+_m = split_metrics(eval_idx)
+roc_auc, f1_macro = _m['roc_auc_macro'], _m['f1_macro']
+roc_auc_per_class = {}
+for _c in range(n_classes):
+    if 0 < eval_one_hot[:, _c].sum() < len(eval_idx):  # needs positives and negatives
+        roc_auc_per_class[_c] = roc_auc_score(eval_one_hot[:, _c], class_probs[:, _c])
 
 # Compute and plot confusion matrix
-cm = confusion_matrix(true_labels, pred_labels)
+cm = confusion_matrix(true_labels, pred_labels, labels=np.arange(n_classes))
 # Row/column order must match the integer labels 0..k-1 that true_labels/pred_labels
 # actually use, i.e. LabelEncoder's sorted class order - NOT metadata.CONDITION.unique()
 # (pandas .unique() returns first-appearance order, which silently mislabels the plot
 # whenever it differs from the alphabetical order LabelEncoder assigned).
 condition_names = label_encoder.classes_
-cm_pct = cm / cm.sum(axis=1, keepdims=True) * 100
+_row = cm.sum(axis=1, keepdims=True)
+cm_pct = np.divide(cm * 100.0, _row, out=np.zeros(cm.shape), where=_row > 0)
 annot = np.array([[f"{c}\n({p:.0f}%)" for c, p in zip(row_c, row_p)]
                    for row_c, row_p in zip(cm, cm_pct)])
 
-fig, ax = plt.subplots(figsize=(1.6 * len(condition_names) + 3, 1.4 * len(condition_names) + 3))
-sns.heatmap(cm, annot=annot, fmt='', cmap='Blues',
+fig, ax = plt.subplots(figsize=(1.6 * len(condition_names) + 3.5, 1.6 * len(condition_names) + 3))
+sns.heatmap(cm, annot=annot, fmt='', cmap='Blues', square=True,
             xticklabels=condition_names, yticklabels=condition_names,
-            cbar_kws={'label': 'Samples'}, linewidths=0.5, linecolor='white', ax=ax)
+            cbar_kws={'label': 'Samples', 'shrink': 0.8}, linewidths=0.5, linecolor='white', ax=ax)
+square_frame(ax)
 ax.set_xlabel('Predicted Condition')
 ax.set_ylabel('True Condition')
-ax.set_title(f'Confusion Matrix\nF1 (macro) = {f1_macro:.2f}  |  ROC-AUC (macro) = {roc_auc:.2f}')
+ax.set_title(f'Confusion Matrix - {eval_label}\nF1 (macro) = {f1_macro:.2f}  |  ROC-AUC (macro) = {roc_auc:.2f}')
 plt.tight_layout()
-plt.savefig(plots_dir+'Confusion_matrix_figure.pdf')
+plt.savefig(plots_dir+'confusion_matrix.pdf')
 plt.close(fig)
 
 
@@ -1375,55 +1456,20 @@ plt.close(fig)
 #
 #-----------------------------------------------------------------------
 
-edge_attn = torch.FloatTensor(attention.iloc[:,2:].mean(axis=1))
-src_nodes = edge_index[0]
-tgt_nodes = edge_index[1]
-# Aggregate per-node attention (e.g., mean of outgoing edge attentions)
-node_attention_sum = torch.zeros((x.shape[0], 1), device=edge_attn.device)
-node_attention_count = torch.zeros((x.shape[0], 1), device=edge_attn.device)
-node_attention_sum.index_add_(0, src_nodes, edge_attn)
-node_attention_count.index_add_(0, src_nodes, torch.ones_like(src_nodes, dtype=torch.float32).unsqueeze(1))
-
-# Filter nodes with non-zero counts
-connected_mask = (node_attention_count > 0).squeeze()
-connected_nodes = torch.arange(x.shape[0], device=device)[connected_mask].cpu().numpy()
-print(f"Filtering out {x.shape[0] - len(connected_nodes)} nodes with zero attention count")
-# Filter node-related data
-node_attention_sum = node_attention_sum[connected_mask].detach().cpu().numpy()
-node_attention_count = node_attention_count[connected_mask].detach().cpu().numpy()
-node_type_filtered = node_type[connected_mask].cpu().numpy()
-saliency_filtered = saliency[connected_mask]
-# Create node mapping for edge indices
-#node_mapping = {old: new for new, old in enumerate(connected_nodes)}
-# Filter attention DataFrame
-#attention_filtered = attention[
-#    attention['source'].isin(connected_nodes) & 
-#    attention['target'].isin(connected_nodes)
-#].copy()
-#attention_filtered['source'] = attention_filtered['source'].map(node_mapping)
-#attention_filtered['target'] = attention_filtered['target'].map(node_mapping)
-
-node_attention_mean = abs(node_attention_sum) / node_attention_count
-node_attention_mean = (node_attention_mean.T*(abs(saliency_filtered).mean(axis=1))).T
-node_attention_mean = (node_attention_mean/node_attention_mean.sum())*100
-node_attention_mean = abs(saliency_filtered).mean(axis=1)
-
-
-#sample_node_attention = pd.concat([pd.DataFrame(trans.columns[1:]),pd.DataFrame(node_attention_mean[node_type == 2])], axis=1)
-#sample_node_attention.columns = ['Sample_ID', 'Attention']
-#node_attention_mean = (node_attention_mean/node_attention_mean[node_type != 2].sum())*100
-#sample_node_attention = node_attention_mean[node_type == 2]
-#gene_node_attention = node_attention_mean[node_type == 0]
-# Per-omic Feature/Attention dataframe - generalizes the original script's two
-# hand-written gene_node_attention/metabo_node_attention frames to N omics.
-omic_node_attention = {}
-for _oi, _name in enumerate(OMIC_NAMES):
-    _df = pd.concat([
-        omic_dfs[_name]['ID'].reset_index(drop=True),
-        pd.DataFrame(node_attention_mean[node_type_filtered == _oi])
-    ], axis=1)
-    _df.columns = [f'{_name}_ID', 'Attention']
-    omic_node_attention[_name] = _df
+# Per-omic Feature/Attribution dataframe. Built by POSITION over the global node index
+# (OMIC_FEATURE_OFFSETS), so every feature keeps its own score even if it has no
+# outgoing edge. (The old version dropped edge-less nodes first and then concatenated
+# the full ID column against the shorter score column, which silently shifted IDs.)
+omic_node_attribution = {}
+for _name in OMIC_NAMES:
+    _start = OMIC_FEATURE_OFFSETS[_name]
+    _n = encoded[_name].shape[0]
+    assert omic_dfs[_name].shape[0] == _n, f"{_name}: ID column and graph features differ in length"
+    omic_node_attribution[_name] = pd.DataFrame({
+        'node': np.arange(_start, _start + _n),  # global node index (unambiguous, unlike IDs)
+        f'{_name}_ID': omic_dfs[_name]['ID'].values,
+        'Attribution': node_attr_magnitude[_start:_start + _n],
+    })
 #sample_node_attention = pd.concat([pd.DataFrame(trans.columns[1:]),pd.DataFrame(node_attention_mean[node_type == 2].detach().numpy())], axis=1)
 #import mygene
 #mg = mygene.MyGeneInfo()
@@ -1437,499 +1483,74 @@ for _oi, _name in enumerate(OMIC_NAMES):
 # --------------------------
 omic_feature_dfs = {}
 for _name in OMIC_NAMES:
-    _df = omic_node_attention[_name][[f'{_name}_ID', 'Attention']].copy()
+    _df = omic_node_attribution[_name][['node', f'{_name}_ID', 'Attribution']].copy()
     _df['Type'] = f'{_name}_feature'
     _df = _df.rename(columns={f'{_name}_ID': 'Feature'})
     omic_feature_dfs[_name] = _df
 combined = pd.concat(list(omic_feature_dfs.values()), ignore_index=True)
-combined = combined.sort_values('Attention', ascending=False).reset_index(drop=True)
+combined = combined.sort_values('Attribution', ascending=False).reset_index(drop=True)
 # --------------------------
 # Cumulative attention + saturation
 # --------------------------
-combined['Cumulative_Attention'] = combined['Attention'].cumsum()
-combined['Cumulative_Attention_%'] = 100 * combined['Cumulative_Attention'] / combined['Attention'].sum()
+combined['Cumulative_Attribution'] = combined['Attribution'].cumsum()
+combined['Cumulative_Attribution_%'] = 100 * combined['Cumulative_Attribution'] / combined['Attribution'].sum()
 saturation_threshold = 95
-saturation_idx = (combined['Cumulative_Attention_%'] >= saturation_threshold).idxmax()
+saturation_idx = (combined['Cumulative_Attribution_%'] >= saturation_threshold).idxmax()
 saturation_x = saturation_idx + 1
-saturation_y = combined.loc[saturation_idx, 'Cumulative_Attention_%']
+saturation_y = combined.loc[saturation_idx, 'Cumulative_Attribution_%']
 #top_features = combined.iloc[:saturation_x]
 top_features = combined.iloc[:min(combined.shape[0],300)]
 # --------------------------
-# Prepare top 100 features per omic
+# Figure: top 10 features per omic, top 10 overall, cumulative curve (square panels)
 # --------------------------
-omic_top100 = {_name: _df.sort_values('Attention', ascending=False).head(min(100, _df.shape[0]))
-                for _name, _df in omic_feature_dfs.items()}
-omic_total_attention = {_name: _df['Attention'].sum() for _name, _df in omic_feature_dfs.items()}
-# --------------------------
-# Plot all into one PDF page
-# --------------------------
-fig = plt.figure(figsize=(6 * (len(OMIC_NAMES) + 1), 24))
-gs = gridspec.GridSpec(2, len(OMIC_NAMES) + 1, height_ratios=[1, 0.6])
-# Top 100 features, one panel per omic
+N_TOP_BARS = 10
+omic_top = {_name: _df.sort_values('Attribution', ascending=False).head(N_TOP_BARS)
+            for _name, _df in omic_feature_dfs.items()}
+omic_total_attribution = {_name: _df['Attribution'].sum() for _name, _df in omic_feature_dfs.items()}
+_n_panels = len(OMIC_NAMES) + 2
+_ncols = _n_panels if _n_panels <= 4 else 3  # one row for up to 2 omics
+_nrows = int(np.ceil(_n_panels / _ncols))
+fig, _axes = plt.subplots(_nrows, _ncols, figsize=(5.4 * _ncols, 5.6 * _nrows), squeeze=False)
+_axes = _axes.ravel()
+
+def _bar_panel(ax, df, colors, title):
+    y = np.arange(len(df))[::-1]
+    ax.barh(y, df['Attribution'].values, color=colors, edgecolor='black', linewidth=0.5, height=0.72)
+    ax.set_yticks(y)
+    ax.set_yticklabels([str(f) if len(str(f)) <= 24 else str(f)[:23] + '…' for f in df['Feature']], fontsize=8)
+    ax.set_ylim(-0.6, N_TOP_BARS - 0.4)
+    ax.set_xlabel('Attribution  Σ_c |attention × gradient|', fontsize=9)
+    ax.set_title(title, fontsize=11)
+    ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(3))
+    square_frame(ax)
+
 for _oi, _name in enumerate(OMIC_NAMES):
-    _ax = fig.add_subplot(gs[0, _oi])
-    _ax.barh(omic_top100[_name]['Feature'], omic_top100[_name]['Attention'], color=OMIC_COLORS[_name])
-    _ax.invert_yaxis()
-    _ax.set_xlabel('Attention Score')
-    _ax.set_title(f'Top 100 {_name} Features\nTotal: {omic_total_attention[_name]:.2f} | '
-                  f'Mean: {omic_total_attention[_name] / len(omic_feature_dfs[_name]):.5f}')
-    _ax.tick_params(axis='y', labelsize=5)
-# Top Features Before Saturation
-ax2 = fig.add_subplot(gs[0, len(OMIC_NAMES)])
+    _bar_panel(_axes[_oi], omic_top[_name], OMIC_COLORS[_name],
+               f'Top {N_TOP_BARS} {_name} features\nTotal: {omic_total_attribution[_name]:.3g} | '
+               f'Mean: {omic_total_attribution[_name] / len(omic_feature_dfs[_name]):.3g}')
 _type_to_color = {f'{_name}_feature': OMIC_COLORS[_name] for _name in OMIC_NAMES}
-colors = top_features['Type'].map(_type_to_color)
-ax2.barh(top_features['Feature'], top_features['Attention'], color=colors)
-ax2.invert_yaxis()
-ax2.set_xlabel('Attention Score')
-ax2.set_title(f'Features Before Saturation\nTop {top_features.shape[0]}/{saturation_x} Features to reach {saturation_threshold}%')
-ax2.tick_params(axis='y', labelsize=3)
-ax2.legend(handles=[Patch(facecolor=OMIC_COLORS[_name], label=_name) for _name in OMIC_NAMES],
+_top_all = combined.head(N_TOP_BARS)
+_ax = _axes[len(OMIC_NAMES)]
+_bar_panel(_ax, _top_all, _top_all['Type'].map(_type_to_color).values,
+           f'Top {N_TOP_BARS} features, all omics\n({saturation_x} features reach {saturation_threshold}% of the total)')
+_ax.legend(handles=[Patch(facecolor=OMIC_COLORS[_name], edgecolor='black', label=_name) for _name in OMIC_NAMES],
            loc='lower right', fontsize=8)
-# Cumulative Attention Curve
-ax3 = fig.add_subplot(gs[1, :])
-ax3.plot(combined['Cumulative_Attention_%'], color='#333333', linewidth=1.5)
+# Cumulative attribution curve
+ax3 = _axes[len(OMIC_NAMES) + 1]
+ax3.plot(np.arange(1, len(combined) + 1), combined['Cumulative_Attribution_%'], color='#333333', linewidth=1.5)
 ax3.axvline(x=saturation_x, color=OKABE_ITO[4], linestyle='--', linewidth=1.2)
 ax3.axhline(y=saturation_y, color=OKABE_ITO[4], linestyle='--', linewidth=1.2)
-ax3.text(saturation_x + 2, saturation_y - 5, f'{saturation_x} features\n({saturation_y:.2f}%)',
-         color=OKABE_ITO[4], fontsize=10, ha='left', va='top')
-ax3.set_xlabel('Number of Top Features')
-ax3.set_ylabel('Cumulative Attention (%)')
-ax3.set_title('Cumulative Feature Attention with Saturation Threshold')
-# Final layout & save
+ax3.text(saturation_x, saturation_y - 5, f' {saturation_x} features\n ({saturation_y:.1f}%)',
+         color=OKABE_ITO[4], fontsize=9, ha='left', va='top')
+ax3.set_xlabel('Number of top features', fontsize=9)
+ax3.set_ylabel('Cumulative attribution (%)', fontsize=9)
+ax3.set_title('Cumulative feature attribution', fontsize=11)
+square_frame(ax3)
+for _ax in _axes[_n_panels:]:
+    _ax.set_visible(False)
 plt.tight_layout()
-plt.savefig(plots_dir+'Interpretability_nodes_attention_figure.pdf')
+plt.savefig(plots_dir+'interpretability_nodes_attention.pdf')
 plt.close()
-
-
-
-#-----------------------------------------------------------------------
-#
-#----------------- Leiden Clustering of Top-Feature Attention Network --
-#
-#-----------------------------------------------------------------------
-# Isolates the attention subgraph among the top (<=300) genes/metabolites from the
-# plot above, clusters it with Leiden to find multi-omic "programs", and saves the
-# cluster composition (CSV) and a contracted cluster network (PDF).
-
-import igraph as ig
-import leidenalg
-from collections import defaultdict, Counter
-
-# Map every graph feature-node index -> which omic it belongs to - generalizes the
-# original script's single num_genes_total cutoff (idx < num_genes_total -> gene,
-# else metabolite) to an arbitrary number of omics.
-FEATURE_OMIC_SIZES = {name: omic_matrices[name].shape[0] for name in OMIC_NAMES}
-FEATURE_INDEX_TO_OMIC = np.concatenate([[name] * FEATURE_OMIC_SIZES[name] for name in OMIC_NAMES])
-
-# Map every graph node index -> its feature/sample name, in the same order used
-# throughout (each omic in manifest order, then samples - see utils.build_data_generic()).
-full_node_names = pd.concat(
-    [omic_dfs[name]['ID'].reset_index(drop=True) for name in OMIC_NAMES] + [pd.Series(common_samples)],
-    ignore_index=True
-)
-
-name_to_node_idx = {}
-for i, name in enumerate(full_node_names):
-    name_str = str(name).strip()
-    if name_str not in name_to_node_idx:
-        name_to_node_idx[name_str] = i
-
-# Match the top attention features (genes + metabolites, from the plot above) to
-# their global node index in the attention graph.
-top_feature_node_idx = []
-top_feature_names_found = []
-for name in top_features['Feature']:
-    name_str = str(name).strip()
-    if name_str in name_to_node_idx:
-        top_feature_node_idx.append(name_to_node_idx[name_str])
-        top_feature_names_found.append(name_str)
-print(f"Leiden clustering: matched {len(top_feature_node_idx)}/{len(top_features)} top features to graph nodes")
-
-# Rebuild a clean src/tgt/mean_attention edge table from the same attention data
-# used for the plot above (avoids relying on the attention CSV's column names).
-edge_attention_df = pd.DataFrame({
-    'src': attention.iloc[:, 0].astype(int).values,
-    'tgt': attention.iloc[:, 1].astype(int).values,
-    'mean_attention': edge_attn.numpy()
-})
-
-# Per-feature attention score (used both as a node attribute for the colormap below
-# and to rank each cluster's top features later on).
-feature_attention_lookup = dict(zip(top_features['Feature'], top_features['Attention']))
-
-G_leiden = nx.Graph()
-for idx, name in zip(top_feature_node_idx, top_feature_names_found):
-    G_leiden.add_node(
-        idx,
-        name=name,
-        type=FEATURE_INDEX_TO_OMIC[idx],
-        attention=float(feature_attention_lookup.get(name, 0.0))
-    )
-
-top_idx_set = set(top_feature_node_idx)
-sub_edges = edge_attention_df[
-    edge_attention_df['src'].isin(top_idx_set) &
-    edge_attention_df['tgt'].isin(top_idx_set) &
-    (edge_attention_df['src'] != edge_attention_df['tgt'])
-].copy()
-
-# The attention graph is directed (src->tgt and tgt->src can carry different
-# attention values); collapse both directions per undirected pair by averaging.
-sub_edges['pair'] = list(zip(
-    np.minimum(sub_edges['src'], sub_edges['tgt']),
-    np.maximum(sub_edges['src'], sub_edges['tgt'])
-))
-edge_summary = sub_edges.groupby('pair')['mean_attention'].mean().reset_index()
-
-for (src, tgt), weight in zip(edge_summary['pair'], edge_summary['mean_attention']):
-    if weight <= 0:
-        continue
-    src_type = G_leiden.nodes[src]['type']
-    tgt_type = G_leiden.nodes[tgt]['type']
-    if src_type == tgt_type:
-        edge_type = f'{src_type}-{src_type}'
-    else:
-        edge_type = '-'.join(sorted((src_type, tgt_type)))
-    G_leiden.add_edge(src, tgt, weight=float(weight), edge_type=edge_type)
-
-isolated_nodes = list(nx.isolates(G_leiden))
-print(f"Leiden clustering: removing {len(isolated_nodes)} isolated nodes out of {G_leiden.number_of_nodes()}")
-G_leiden.remove_nodes_from(isolated_nodes)
-
-valid_clusters = set()  # default so downstream code can safely check "if valid_clusters:"
-G_cluster = nx.Graph()
-node_to_cluster = {}
-cluster_df = pd.DataFrame(columns=['Feature', 'Node_Type', 'Attention', 'Leiden_Cluster',
-                                    'Cluster_Size', 'Kept_In_Network_Plot'])
-program_activity = pd.DataFrame(index=common_samples)
-
-if G_leiden.number_of_nodes() == 0 or G_leiden.number_of_edges() == 0:
-    print("Leiden clustering: no connected top-feature subgraph found, skipping cluster analysis.")
-else:
-    # ────────────────────────────────────────────────
-    # Leiden clustering (igraph/leidenalg), weighted by mean attention
-    # ────────────────────────────────────────────────
-    nx_nodes = list(G_leiden.nodes())
-    node_id_map = {node: i for i, node in enumerate(nx_nodes)}
-    ig_edges = [(node_id_map[u], node_id_map[v]) for u, v in G_leiden.edges()]
-    ig_weights = [G_leiden[u][v]['weight'] for u, v in G_leiden.edges()]
-
-    g_ig = ig.Graph()
-    g_ig.add_vertices(len(nx_nodes))
-    g_ig.add_edges(ig_edges)
-    g_ig.es['weight'] = ig_weights
-
-    leiden_partition = leidenalg.find_partition(
-        g_ig,
-        leidenalg.RBConfigurationVertexPartition,
-        weights=g_ig.es['weight'],
-        resolution_parameter=args.leiden_resolution,
-        seed=seed
-    )
-    for nx_node, cluster_id in zip(nx_nodes, leiden_partition.membership):
-        G_leiden.nodes[nx_node]['leiden_cluster'] = cluster_id
-
-    node_to_cluster = nx.get_node_attributes(G_leiden, 'leiden_cluster')
-    cluster_sizes = Counter(node_to_cluster.values())
-    valid_clusters = {cid for cid, size in cluster_sizes.items() if size >= args.leiden_min_cluster_size}
-    print(f"Leiden clustering: found {len(cluster_sizes)} clusters, keeping {len(valid_clusters)} "
-          f"with >= {args.leiden_min_cluster_size} features")
-
-    # ────────────────────────────────────────────────
-    # Save cluster composition to CSV (one row per feature)
-    # ────────────────────────────────────────────────
-    cluster_rows = [
-        {
-            'Feature': node_data['name'],
-            'Node_Type': node_data['type'],
-            'Attention': feature_attention_lookup.get(node_data['name'], np.nan),
-            'Leiden_Cluster': node_data['leiden_cluster'],
-            'Cluster_Size': cluster_sizes[node_data['leiden_cluster']],
-            'Kept_In_Network_Plot': node_data['leiden_cluster'] in valid_clusters
-        }
-        for _, node_data in G_leiden.nodes(data=True)
-    ]
-    cluster_df = pd.DataFrame(cluster_rows).sort_values(
-        ['Leiden_Cluster', 'Attention'], ascending=[True, False]
-    ).reset_index(drop=True)
-    cluster_csv_path = plots_dir + "leiden_clusters_composition.csv"
-    cluster_df.to_csv(cluster_csv_path, index=False)
-    print(f"Leiden clustering: cluster composition saved to {cluster_csv_path}")
-
-    # ────────────────────────────────────────────────
-    # Contract into a cluster-level network: one node per Leiden "program"
-    # ────────────────────────────────────────────────
-    G_cluster = nx.Graph()
-    for cid in valid_clusters:
-        members = [n for n, c in node_to_cluster.items() if c == cid]
-        member_types = [G_leiden.nodes[n]['type'] for n in members]
-        G_cluster.add_node(
-            cid,
-            size=len(members),
-            dominant_type=max(set(member_types), key=member_types.count)
-        )
-
-    edge_accumulator = defaultdict(float)
-    edge_type_accumulator = defaultdict(list)
-    for u, v, edge_data in G_leiden.edges(data=True):
-        cu, cv = node_to_cluster[u], node_to_cluster[v]
-        if cu not in valid_clusters or cv not in valid_clusters or cu == cv:
-            continue  # internal edges disappear after contraction
-        key = tuple(sorted((cu, cv)))
-        edge_accumulator[key] += edge_data.get('weight', 1.0)
-        edge_type_accumulator[key].append(edge_data.get('edge_type', 'unknown'))
-
-    for (cu, cv), weight in edge_accumulator.items():
-        types = edge_type_accumulator[(cu, cv)]
-        dominant_type = max(set(types), key=types.count)
-        G_cluster.add_edge(cu, cv, weight=weight, edge_type=dominant_type, n_edges=len(types))
-
-    # ────────────────────────────────────────────────
-    # Plot: contracted cluster network
-    # ────────────────────────────────────────────────
-    if G_cluster.number_of_nodes() == 0:
-        print("Leiden clustering: no clusters passed the minimum size filter, skipping network plot.")
-    else:
-        # G_cluster's edge weight is a SUM over every contracted original edge, so it can
-        # range from 1 up into the hundreds - robust_layout() normalizes and inverts this
-        # internally before it ever reaches Kamada-Kawai (see its docstring). Edge width
-        # still encodes the true raw weight visually (see `widths` below).
-        pos = robust_layout(G_cluster, seed=seed)
-        n_cluster_nodes = G_cluster.number_of_nodes()
-        cmap = plt.cm.get_cmap('tab20', n_cluster_nodes)
-        node_color_by_id = {n: cmap(i) for i, n in enumerate(G_cluster.nodes())}
-
-        def _size(n):
-            return 120 + 400 * np.log1p(G_cluster.nodes[n]['size'])
-
-        cluster_weights = np.array([G_cluster[u][v]['weight'] for u, v in G_cluster.edges()])
-        widths = 0.2 + 2.5 * (cluster_weights / cluster_weights.max()) if len(cluster_weights) > 0 else 0.5
-
-        # Top 5 highest-attention features per cluster, for the on-plot labels below.
-        # cluster_df is already sorted by Attention (descending) within each cluster.
-        top5_labels_per_cluster = (
-            cluster_df[cluster_df['Kept_In_Network_Plot']]
-            .groupby('Leiden_Cluster')['Feature']
-            .apply(lambda s: s.head(5).tolist())
-            .to_dict()
-        )
-
-        fig, ax = plt.subplots(figsize=(9.5, 9.5))
-        nx.draw_networkx_edges(G_cluster, pos, width=widths, alpha=0.18, edge_color="#4a4a4a", ax=ax)
-        # Marker shape encodes each program's dominant omic type, an attribute that
-        # was already computed but previously unused visually.
-        for dom_type in OMIC_NAMES:
-            marker = OMIC_MARKERS_BY_NAME[dom_type]
-            nodes_of_type = [n for n in G_cluster.nodes() if G_cluster.nodes[n]['dominant_type'] == dom_type]
-            if not nodes_of_type:
-                continue
-            nx.draw_networkx_nodes(
-                G_cluster, pos, nodelist=nodes_of_type, node_shape=marker,
-                node_size=[_size(n) for n in nodes_of_type],
-                node_color=[node_color_by_id[n] for n in nodes_of_type],
-                edgecolors="black", linewidths=0.5, ax=ax
-            )
-        # Annotate each cluster with its top 5 highest-attention features, on a
-        # white background so the labels stay legible over the muted edges.
-        for cid, (x, y) in pos.items():
-            labels = top5_labels_per_cluster.get(cid, [])
-            if not labels:
-                continue
-            ax.annotate(
-                "\n".join(labels),
-                xy=(x, y),
-                xytext=(8, 8),
-                textcoords='offset points',
-                fontsize=5,
-                ha='left',
-                va='bottom',
-                bbox=dict(boxstyle='round,pad=0.25', facecolor='white',
-                          edgecolor='#cccccc', linewidth=0.5, alpha=0.85),
-                zorder=5
-            )
-        _frame_axes_to_pos(ax, pos)
-        ax.axis("off")
-        ax.set_title(
-            f"Multi-omic attention clusters (Leiden, top {len(top_feature_node_idx)} features, "
-            f"{n_cluster_nodes} programs)",
-            fontsize=12
-        )
-        # Legends: marker shape = dominant omic type, reference circles = program size.
-        shape_legend = ax.legend(
-            handles=[Line2D([0], [0], marker=OMIC_MARKERS_BY_NAME[_name], color='w', markerfacecolor='#888888',
-                             markeredgecolor='black', markersize=9, label=f'{_name}-dominant program')
-                     for _name in OMIC_NAMES],
-            loc='upper left', fontsize=8, title='Program type', title_fontsize=8
-        )
-        ax.add_artist(shape_legend)
-        size_ref = sorted(set(G_cluster.nodes[n]['size'] for n in G_cluster.nodes()))
-        size_ref = [size_ref[0], size_ref[len(size_ref) // 2], size_ref[-1]] if len(size_ref) > 2 else size_ref
-        ax.legend(
-            handles=[Line2D([0], [0], marker='o', color='w', markerfacecolor='#cccccc',
-                             markeredgecolor='black', markersize=np.sqrt(120 + 400 * np.log1p(s)) / 3.5,
-                             label=f'{s} features')
-                     for s in size_ref],
-            loc='lower left', fontsize=8, title='Program size', title_fontsize=8, labelspacing=1.2
-        )
-        plt.tight_layout()
-        cluster_pdf_path = plots_dir + "leiden_cluster_network.pdf"
-        plt.savefig(cluster_pdf_path, bbox_inches="tight", dpi=300)
-        plt.close(fig)
-        print(f"Leiden clustering: cluster network plot saved to {cluster_pdf_path}")
-
-    # ────────────────────────────────────────────────
-    # Per-cluster attention subgraphs: one PDF page per Leiden cluster, nodes/edges
-    # colored blue (low) -> red (high) by attention.
-    # ────────────────────────────────────────────────
-    import matplotlib.colors as mcolors
-    import matplotlib.patheffects as path_effects
-    from matplotlib.backends.backend_pdf import PdfPages
-
-    def draw_cluster_attention_subgraph(G_full, target_cluster, figsize=(11, 11), seed=7):
-        """
-        Subsets G_full to one Leiden cluster and draws its attention subnetwork: each
-        omic gets its own marker shape (OMIC_MARKERS_BY_NAME), edges/nodes colored
-        blue->red by attention (RdBu_r). Returns the matplotlib Figure, or None if the
-        cluster is empty.
-        """
-        cluster_nodes = [n for n, d in G_full.nodes(data=True) if d.get('leiden_cluster') == target_cluster]
-        if not cluster_nodes:
-            return None
-
-        G_sub = G_full.subgraph(cluster_nodes).copy()
-
-        pos = robust_layout(G_sub, seed=seed)
-
-        def norm_val(v, mn, mx):
-            return (v - mn) / (mx - mn) if mx > mn else 0.5
-
-        # Node attention comes from the 'attention' node attribute set when G_leiden was
-        # built above (the per-feature attention score) - without it every node would
-        # normalize to the same 0.5 midpoint and render as flat gray regardless of shape.
-        node_att_values = [G_sub.nodes[n].get('attention', 0.0) for n in G_sub.nodes]
-        min_node_att, max_node_att = (min(node_att_values), max(node_att_values)) if node_att_values else (0.0, 1.0)
-
-        edge_weights_sub = [d.get('weight', 1.0) for _, _, d in G_sub.edges(data=True)]
-        min_edge_w, max_edge_w = (min(edge_weights_sub), max(edge_weights_sub)) if edge_weights_sub else (1.0, 1.0)
-
-        cmap = plt.cm.get_cmap('RdBu_r')
-
-        fig, ax = plt.subplots(figsize=figsize, facecolor='#FFFFFF')
-        ax.set_facecolor('#FFFFFF')
-        ax.axis('off')
-
-        # ─── Edges (color + width mapped to attention weight) ───
-        for u, v, d in G_sub.edges(data=True):
-            w = d.get('weight', 1.0)
-            norm_w = norm_val(w, min_edge_w, max_edge_w)
-            edge_color = cmap(norm_w)
-            edge_width = 0.5 + norm_w * 4.5
-            x0, y0 = pos[u]
-            x1, y1 = pos[v]
-            ax.plot([x0, x1], [y0, y1], color=edge_color, lw=edge_width, alpha=0.6, zorder=1)
-
-        # ─── Nodes (split by omic for different marker shapes) ───
-        nodes_by_omic = {_name: [n for n in G_sub.nodes if G_sub.nodes[n].get('type') == _name] for _name in OMIC_NAMES}
-        node_groups = [
-            {'nodes': nodes_by_omic[_name], 'marker': OMIC_MARKERS_BY_NAME[_name],
-             'base_size': 200, 'scale_size': 800, 'label': _name}
-            for _name in OMIC_NAMES
-        ]
-        for group in node_groups:
-            if not group['nodes']:
-                continue
-            g_nodes = group['nodes']
-            g_atts = [G_sub.nodes[n].get('attention', 0.0) for n in g_nodes]
-            g_norm_atts = [norm_val(a, min_node_att, max_node_att) for a in g_atts]
-            node_colors_sub = [cmap(na) for na in g_norm_atts]
-            node_sizes = [group['base_size'] + na * group['scale_size'] for na in g_norm_atts]
-            border_colors = [tuple(max(0, c * 0.6) for c in rgba[:3]) + (1.0,) for rgba in node_colors_sub]
-            ax.scatter(
-                [pos[n][0] for n in g_nodes],
-                [pos[n][1] for n in g_nodes],
-                s=node_sizes,
-                c=node_colors_sub,
-                marker=group['marker'],
-                edgecolors=border_colors,
-                linewidths=1.2,
-                label=group['label'],
-                zorder=3
-            )
-
-        # ─── Labels, white-halo text for legibility over edges/nodes ───
-        for n in G_sub.nodes:
-            x, y = pos[n]
-            name = G_sub.nodes[n].get('name', str(n))
-            txt = ax.text(x, y, name, color='#000000', fontsize=6, fontweight='bold',
-                          ha='center', va='center', zorder=4)
-            txt.set_path_effects([path_effects.withStroke(linewidth=3, foreground='#FFFFFF')])
-
-        # Explicit neutral-gray legend proxies for shape - the actual markers are colored
-        # by attention (RdBu_r, see colorbar below), so a legend built from those same
-        # per-point colors would misleadingly imply color varies by omic too.
-        ax.legend(
-            handles=[Line2D([0], [0], marker=OMIC_MARKERS_BY_NAME[_name], color='w', markerfacecolor='#999999',
-                             markeredgecolor='black', markersize=10, label=_name)
-                     for _name in OMIC_NAMES],
-            loc='upper left', frameon=True, facecolor='#FFFFFF', edgecolor='#E0E0E0', fontsize=10
-        )
-
-        norm = mcolors.Normalize(
-            vmin=min_node_att,
-            vmax=max_node_att if max_node_att > min_node_att else min_node_att + 1
-        )
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-        sm.set_array([])
-        cb_ax = fig.add_axes([0.25, 0.04, 0.5, 0.02])
-        cb = plt.colorbar(sm, cax=cb_ax, orientation='horizontal')
-        cb.set_label('Attention Score Intensity (Blue=Low, Red=High)', fontsize=9, labelpad=6)
-        cb.ax.tick_params(labelsize=7)
-
-        ax.set_title(
-            f'Multi-Omic Attention Subgraph — Leiden Cluster {target_cluster}\n'
-            f'({" · ".join(f"{len(nodes_by_omic[_name])} {_name}" for _name in OMIC_NAMES)})',
-            fontsize=13, fontweight='bold', pad=18
-        )
-        _frame_axes_to_pos(ax, pos)
-        ax.axis('off')  # re-assert: set_aspect inside _frame_axes_to_pos doesn't affect visibility
-        return fig
-
-    if not valid_clusters:
-        print("Leiden clustering: no clusters passed the minimum size filter, skipping per-cluster subgraphs.")
-    else:
-        cluster_subgraphs_pdf_path = plots_dir + "leiden_cluster_subgraphs.pdf"
-        with PdfPages(cluster_subgraphs_pdf_path) as pdf:
-            for cid in sorted(valid_clusters):
-                fig = draw_cluster_attention_subgraph(G_leiden, target_cluster=cid)
-                if fig is None:
-                    continue
-                pdf.savefig(fig, bbox_inches='tight', dpi=300)
-                plt.close(fig)
-        print(f"Leiden clustering: {len(valid_clusters)} per-cluster attention subgraphs saved to {cluster_subgraphs_pdf_path}")
-
-    # ────────────────────────────────────────────────
-    # Program activity: for each sample, weight every program member feature's
-    # normalized input value by its attention score and sum within the program.
-    # activity(sample, program) = sum over features f in program of
-    #                              attention(f) * normalized_value(f, sample)
-    # ────────────────────────────────────────────────
-    if not valid_clusters:
-        print("Leiden clustering: no clusters passed the minimum size filter, skipping program activity scores.")
-    else:
-        # `samples_stacked` is the (every omic's features stacked) x samples matrix
-        # built from the raw per-omic input matrices earlier in the script,
-        # row-aligned with the same global feature index used throughout this section
-        # (FEATURE_INDEX_TO_OMIC[idx] gives idx's omic).
-        program_activity = pd.DataFrame(index=common_samples)
-        for cid in sorted(valid_clusters):
-            member_idx = [n for n, c in node_to_cluster.items() if c == cid]
-            member_attention = np.array([G_leiden.nodes[n]['attention'] for n in member_idx])
-            member_expression = samples_stacked[member_idx, :]  # (n_members, n_samples)
-            program_activity[f'Program_{cid}'] = member_attention @ member_expression
-        program_activity.index.name = 'ID'
-        program_activity_csv_path = plots_dir + "leiden_program_activity_scores.csv"
-        program_activity.to_csv(program_activity_csv_path)
-        print(f"Leiden clustering: program activity scores saved to {program_activity_csv_path}")
 
 
 
@@ -1965,226 +1586,539 @@ labels = metadata.CONDITION.reset_index(drop=True)
 node_names = omic_dfs[OMIC_NAMES[0]].columns[1:]
 
 embeddings = {
-    'Cell Nodes': to_numpy(node_rep[node_type == len(OMIC_NAMES)]),
+    'Cell Nodes': sample_matrix,  # every sample (node_rep only holds the last inference batch)
     'g128 Embedding': to_numpy(g128_embeddings),
     'g64 Embedding': to_numpy(g64_embeddings),
     'g32 Embedding': to_numpy(g32_embeddings),
-    'Class Rep': to_numpy(class_rep)
+    'Class Rep': class_embeddings  # every sample (class_rep only holds the last inference batch)
 }
 # ----------------------------------
-# Create Multi-panel Figure
+# Figure: five square panels (sample node embedding, g128, g64, g32, class representation)
 # ----------------------------------
-fig = plt.figure(figsize=(18, 18))
-gs = fig.add_gridspec(3, 3, height_ratios=[1, 1, 1.2])  # Slightly more space for bottom
-# Plot 1: Cell Nodes UMAP (Top row)
-ax1 = fig.add_subplot(gs[0, :])
+def _scatter_by_condition(ax, xy, title, s=20):
+    for cond in labels.unique():
+        idx = (labels == cond).values
+        ax.scatter(xy[idx, 0], xy[idx, 1], label=cond, s=s, color=CONDITION_COLORS[str(cond)],
+                   edgecolors='white', linewidths=0.3)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel('UMAP1', fontsize=9)
+    ax.set_ylabel('UMAP2', fontsize=9)
+    square_frame(ax)
+
+fig = plt.figure(figsize=(16, 11))
+gs = fig.add_gridspec(2, 3, wspace=0.3, hspace=0.3)
+ax1 = fig.add_subplot(gs[0, 0])
 cell_nodes_umap = reduce_embedding(embeddings['Cell Nodes'], n_components=2)
-for cond in labels.unique():
-    idx = labels == cond
-    ax1.scatter(cell_nodes_umap[idx, 0], cell_nodes_umap[idx, 1], label=cond, s=15, color=CONDITION_COLORS[str(cond)])
-
-ax1.set_title('UMAP of Cell Node Embeddings')
-ax1.legend(markerscale=2, fontsize=8)
-# Plot 2: g128 Embedding UMAP
-ax2 = fig.add_subplot(gs[1, 0])
+_scatter_by_condition(ax1, cell_nodes_umap, 'UMAP of sample node embeddings')
+ax1.legend(markerscale=1.5, fontsize=8)
 umap128 = reduce_embedding(embeddings['g128 Embedding'], n_components=2)
-for cond in labels.unique():
-    idx = labels == cond
-    ax2.scatter(umap128[idx, 0], umap128[idx, 1], label=cond, s=10, color=CONDITION_COLORS[str(cond)])
-
-ax2.set_title('UMAP of g128 Embedding')
-# Plot 3: g64 Embedding UMAP
-ax3 = fig.add_subplot(gs[1, 1])
+_scatter_by_condition(fig.add_subplot(gs[0, 1]), umap128, 'UMAP of g128 embedding')
 umap64 = reduce_embedding(embeddings['g64 Embedding'], n_components=2)
-for cond in labels.unique():
-    idx = labels == cond
-    ax3.scatter(umap64[idx, 0], umap64[idx, 1], label=cond, s=10, color=CONDITION_COLORS[str(cond)])
-
-ax3.set_title('UMAP of g64 Embedding')
-# Plot 4: g32 Embedding UMAP
-ax4 = fig.add_subplot(gs[1, 2])
+_scatter_by_condition(fig.add_subplot(gs[0, 2]), umap64, 'UMAP of g64 embedding')
 umap32 = reduce_embedding(embeddings['g32 Embedding'], n_components=2)
-for cond in labels.unique():
-    idx = labels == cond
-    ax4.scatter(umap32[idx, 0], umap32[idx, 1], label=cond, s=10, color=CONDITION_COLORS[str(cond)])
-
-ax4.set_title('UMAP of g32 Embedding')
-# Plot 5: Class Rep — choose UMAP or raw depending on dimensions
+_scatter_by_condition(fig.add_subplot(gs[1, 0]), umap32, 'UMAP of g32 embedding')
+# Class representation: raw when 2-D, 3-D scatter when 3-D, UMAP otherwise
 class_rep_np = embeddings['Class Rep']
 D = class_rep_np.shape[1]
-if D == 2:
-    ax5 = fig.add_subplot(gs[2, :])
+if D == 3:
+    ax5 = fig.add_subplot(gs[1, 1], projection='3d')
     for cond in labels.unique():
-        idx = labels == cond
-        ax5.scatter(class_rep_np[idx, 0], class_rep_np[idx, 1], label=cond, s=15, color=CONDITION_COLORS[str(cond)])
-
-    ax5.set_title('2D Class Representation')
-    ax5.legend(markerscale=2, fontsize=8)
-elif D == 3:
-    ax5 = fig.add_subplot(gs[2, :], projection='3d')
-    for cond in labels.unique():
-        idx = labels == cond
-        ax5.scatter(class_rep_np[idx, 0], class_rep_np[idx, 1], class_rep_np[idx, 2], label=cond, s=15,
-                     color=CONDITION_COLORS[str(cond)])
-
-    ax5.set_title('3D Class Representation')
-    ax5.legend(markerscale=2, fontsize=8)
+        idx = (labels == cond).values
+        ax5.scatter(class_rep_np[idx, 0], class_rep_np[idx, 1], class_rep_np[idx, 2], label=cond, s=20,
+                    color=CONDITION_COLORS[str(cond)])
+    ax5.set_title('3D class representation', fontsize=11)
     ax5.view_init(elev=20, azim=45)
-    # Minimalist 3D panes (default matplotlib gray fill/gridlines read as cluttered in print).
     for axis in (ax5.xaxis, ax5.yaxis, ax5.zaxis):
         axis.pane.set_facecolor((1.0, 1.0, 1.0, 0.0))
-        axis.pane.set_edgecolor('#dddddd')
+        axis.pane.set_edgecolor('#000000')
     ax5.grid(False)
 else:
-    ax5 = fig.add_subplot(gs[2, :])
-    reduced = reduce_embedding(class_rep_np, n_components=2)
-    for cond in labels.unique():
-        idx = labels == cond
-        ax5.scatter(reduced[idx, 0], reduced[idx, 1], label=cond, s=15, color=CONDITION_COLORS[str(cond)])
-
-    ax5.set_title(f'UMAP of Class Rep ({D}D)')
-    ax5.legend(markerscale=2, fontsize=8)
-
-# Final layout and save
-plt.tight_layout()
-plt.savefig(plots_dir+'embeddings_evaluations_figure.pdf')
+    ax5 = fig.add_subplot(gs[1, 1])
+    if D == 2:
+        _scatter_by_condition(ax5, class_rep_np, '2D class representation')
+        ax5.set_xlabel('logit 1', fontsize=9)
+        ax5.set_ylabel('logit 2', fontsize=9)
+    else:
+        _scatter_by_condition(ax5, reduce_embedding(class_rep_np, n_components=2), f'UMAP of class representation ({D}D)')
+plt.savefig(plots_dir+'embeddings_evaluations.pdf', bbox_inches='tight')
 plt.close()
 
 
 
 #-----------------------------------------------------------------------
 #
-#----------------- Program Activity Report (per multi-omic program) ----
+#----------------- Multi-omic programs (one analysis per target condition)
 #
 #-----------------------------------------------------------------------
-# One PDF page per program, answering: "is there a real difference in this
-# program's activity between conditions, and do we have the power to detect it?"
-# Panels: (1) sample UMAP colored by condition, (2) same UMAP colored by program
-# activity, (3) activity boxplot by condition with a non-parametric test + effect
-# size + group sizes (a p-value alone says nothing about whether a null result is
-# a real null or just an underpowered comparison - effect size and n give that
-# context), (4) a decoupleR-style barplot of each program's feature contributions,
-# signed by which condition group the feature trends higher in.
+# For every target condition c in --target_class:
+#   1. Features: the top <= 300 features with a POSITIVE class-specific score
+#      score_c = attr_c - max(attr_off_c, 0) (see the inference block): evidence the model
+#      uses to call c in c-samples, without also pushing the other samples towards c.
+#   2. Edges: the graph's existing feature-feature edges between those features. The
+#      weight of a pair is max(score_c(i->j), 0) + max(score_c(j->i), 0): attention is
+#      not symmetric, so each direction is clipped before adding them. Leiden
+#      (RBConfiguration) needs non-negative weights.
+#   3. Programs: Leiden clusters with >= --leiden_min_cluster_size features, numbered
+#      P1, P2, ... from the largest.
+#   4. Activity per sample: A(s) = sum_f w_f * sigma_f * z(f, s) / sum_f w_f, where
+#      w_f = score_c(f) is the importance (model), z the input matrix z-scored per feature
+#      with the TRAINING samples' mean/SD (log1p-transformed first when the input is
+#      non-negative, e.g. counts or intensities), and sigma_f = +-1 the direction (data):
+#      the sign of f's loading on the program's first principal component of z over the
+#      training samples (label-free; oriented so the highest-weight member is +). Up- and
+#      down-regulated members add up instead of cancelling; w_f * sigma_f is the member's
+#      signed weight in the activity.
+#   5. Statistics per program (as in the PTB program figures): Mann-Whitney U, c vs rest,
+#      and the difference of mean activity (c - rest, SD units) on ALL samples, with
+#      Benjamini-Hochberg q across the condition's programs. Most samples trained the
+#      model that defined the programs, so this is descriptive; the same test on the
+#      HELD-OUT TEST samples only is reported next to it.
+# Outputs: plots/programs_<condition>/ and supplementary/programs_<condition>/.
 
-if not valid_clusters:
-    print("Leiden clustering: no clusters passed the minimum size filter, skipping program activity report.")
+import re
+import igraph as ig
+import leidenalg
+from collections import defaultdict, Counter
+import matplotlib.colors as mcolors
+import matplotlib.patheffects as path_effects
+from matplotlib.backends.backend_pdf import PdfPages
+from scipy.stats import mannwhitneyu, kruskal
+from pramigo_figures import bh_fdr, square_frame, draw_program_network, draw_program_members
+
+# Global feature index -> omic name.
+FEATURE_OMIC_SIZES = {name: omic_matrices[name].shape[0] for name in OMIC_NAMES}
+FEATURE_INDEX_TO_OMIC = np.concatenate([[name] * FEATURE_OMIC_SIZES[name] for name in OMIC_NAMES])
+
+condition_labels = metadata['CONDITION'].reset_index(drop=True).astype(str).values
+unique_conditions = sorted(pd.unique(condition_labels))
+is_heldout_test = np.zeros(len(common_samples), dtype=bool)
+is_heldout_test[test_idx] = True
+
+# Activity input: per-feature z-score with TRAINING statistics (log1p first if non-negative).
+_X_act = samples_stacked.astype(float)
+if np.nanmin(_X_act) >= 0:
+    _X_act = np.log1p(_X_act)
+    ACTIVITY_INPUT = 'log1p + z-scored inputs'
 else:
-    from scipy.stats import mannwhitneyu, kruskal
-    # matplotlib.colors (mcolors) and PdfPages were already imported earlier in the
-    # Leiden clustering section above.
+    ACTIVITY_INPUT = 'z-scored inputs'
+_mu = _X_act[:, train_idx].mean(axis=1, keepdims=True)
+_sd = _X_act[:, train_idx].std(axis=1, keepdims=True)
+_sd[~np.isfinite(_sd) | (_sd == 0)] = 1.0
+Z_ACT = (_X_act - _mu) / _sd
+del _X_act, _mu, _sd
+print(f"Program activity computed on {ACTIVITY_INPUT} (training-sample mean/SD).")
 
-    condition_labels = metadata['CONDITION'].reset_index(drop=True).astype(str).values
-    unique_conditions = sorted(pd.unique(condition_labels))
-    condition_palette = CONDITION_COLORS  # shared across every condition-colored plot in this script
 
-    def _contrast_groups(values, groups, group_names):
-        # The two groups with the most different mean activity - used to give the
-        # feature-contribution barplot a consistent, well-defined up/down direction
-        # even when there are more than two conditions.
-        means = {g: values[groups == g].mean() for g in group_names}
-        return min(means, key=means.get), max(means, key=means.get)
+def _mw(values, is_target):
+    v_t, v_r = values[is_target], values[~is_target]
+    if len(v_t) == 0 or len(v_r) == 0:
+        return np.nan, np.nan
+    _, p = mannwhitneyu(v_t, v_r, alternative='two-sided')
+    return p, v_t.mean() - v_r.mean()
 
-    def _mannwhitney_effect(values, groups, g_low, g_high):
-        v_low = values[groups == g_low]
-        v_high = values[groups == g_high]
-        stat, p = mannwhitneyu(v_low, v_high, alternative='two-sided')
-        n_low, n_high = len(v_low), len(v_high)
-        effect = abs(1 - (2 * stat) / (n_low * n_high))  # |rank-biserial correlation|
-        return {'p': p, 'effect': effect, 'n_low': n_low, 'n_high': n_high}
 
-    program_report_pdf_path = plots_dir + "leiden_program_activity_report.pdf"
-    with PdfPages(program_report_pdf_path) as pdf:
-        for cid in sorted(valid_clusters):
-            activity_values = program_activity[f'Program_{cid}'].values
+def draw_cluster_subgraph(G_full, target_cluster, pname, tname, figsize=(11, 11), seed=7):
+    """One Leiden program's subnetwork, on the same red-white-blue scale as the report's signed
+    weights: node colour = the member's signed activity weight (score x sigma; red raises the
+    activity, blue lowers it), node size = |signed weight|; edge colour/width = the edge weight
+    used by Leiden (always >= 0, so white to red). Omic -> marker shape."""
+    cluster_nodes = [n for n, d in G_full.nodes(data=True) if d.get('leiden_cluster') == target_cluster]
+    if not cluster_nodes:
+        return None
+    G_sub = G_full.subgraph(cluster_nodes).copy()
+    pos = robust_layout(G_sub, seed=seed)
+    cmap = plt.cm.get_cmap('RdBu_r')
+    node_vals = np.array([G_sub.nodes[n].get('signed_weight', G_sub.nodes[n]['score']) for n in G_sub.nodes])
+    vlim = float(np.abs(node_vals).max()) or 1.0
+    node_norm = mcolors.TwoSlopeNorm(vcenter=0, vmin=-vlim, vmax=vlim)
+    val_of = dict(zip(G_sub.nodes, node_vals))
+    edge_ws = [d.get('weight', 1.0) for _, _, d in G_sub.edges(data=True)]
+    wmax = max(edge_ws) if edge_ws else 1.0
 
-            member_idx = [n for n, c in node_to_cluster.items() if c == cid]
-            member_names = [G_leiden.nodes[n]['name'] for n in member_idx]
+    fig, ax = plt.subplots(figsize=figsize, facecolor='#FFFFFF')
+    ax.set_facecolor('#FFFFFF')
+    for u, v, d in G_sub.edges(data=True):
+        rel = d.get('weight', 1.0) / wmax
+        ax.plot([pos[u][0], pos[v][0]], [pos[u][1], pos[v][1]], color=cmap(0.5 + 0.5 * rel), lw=0.5 + rel * 4.5,
+                alpha=0.8, zorder=1)
+    nodes_by_omic = {_name: [n for n in G_sub.nodes if G_sub.nodes[n].get('type') == _name] for _name in OMIC_NAMES}
+    for _name in OMIC_NAMES:
+        g_nodes = nodes_by_omic[_name]
+        if not g_nodes:
+            continue
+        ax.scatter([pos[n][0] for n in g_nodes], [pos[n][1] for n in g_nodes],
+                   s=[200 + 800 * abs(val_of[n]) / vlim for n in g_nodes], c=[cmap(node_norm(val_of[n])) for n in g_nodes],
+                   marker=OMIC_MARKERS_BY_NAME[_name], edgecolors='black', linewidths=0.8, zorder=3)
+    for n in G_sub.nodes:
+        txt = ax.text(pos[n][0], pos[n][1], G_sub.nodes[n].get('name', str(n)), color='#000000', fontsize=6,
+                      fontweight='bold', ha='center', va='center', zorder=4)
+        txt.set_path_effects([path_effects.withStroke(linewidth=3, foreground='#FFFFFF')])
+    ax.legend(handles=[Line2D([0], [0], marker=OMIC_MARKERS_BY_NAME[_name], color='w', markerfacecolor='#999999',
+                              markeredgecolor='black', markersize=10, label=_name) for _name in OMIC_NAMES],
+              loc='upper left', frameon=True, facecolor='#FFFFFF', edgecolor='#E0E0E0', fontsize=10)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=node_norm)
+    sm.set_array([])
+    cb = plt.colorbar(sm, cax=fig.add_axes([0.25, 0.04, 0.5, 0.02]), orientation='horizontal')
+    cb.set_label(f"Nodes: signed weight score_{tname} × σ (red raises, blue lowers the activity)\n"
+                 "Edges: Leiden weight (white → red)", fontsize=9, labelpad=6)
+    cb.ax.tick_params(labelsize=7)
+    ax.set_title(f"'{tname}' program {pname}\n"
+                 f'({" · ".join(f"{len(nodes_by_omic[_name])} {_name}" for _name in OMIC_NAMES)})',
+                 fontsize=13, fontweight='bold', pad=18)
+    _frame_axes_to_pos(ax, pos)
+    ax.axis('off')
+    return fig
 
-            g_low, g_high = _contrast_groups(activity_values, condition_labels, unique_conditions)
-            pairwise = _mannwhitney_effect(activity_values, condition_labels, g_low, g_high)
-            stats_lines = [
-                f"Mann-Whitney U: p={pairwise['p']:.3g}, |r|={pairwise['effect']:.2f}, "
-                f"higher in {g_high} (n={pairwise['n_low']} vs {pairwise['n_high']})"
-            ]
-            if len(unique_conditions) > 2:
-                kw_stat, kw_p = kruskal(*[activity_values[condition_labels == g] for g in unique_conditions])
-                k, n_total = len(unique_conditions), len(activity_values)
-                eps2 = (kw_stat - k + 1) / (n_total - k) if n_total > k else np.nan
-                stats_lines.insert(0, f"Kruskal-Wallis (all {k} groups): p={kw_p:.3g}, ε²={eps2:.2f}")
 
-            # Sign each feature's attention score by whether its normalized input value
-            # trends higher in the high- or low-activity group (proxy for logFC direction;
-            # the inputs are already filtered/normalized, not raw counts, so only the sign
-            # of the group difference - not a literal fold change - is well defined here).
-            low_mask = condition_labels == g_low
-            high_mask = condition_labels == g_high
-            signed_scores = []
-            for idx in member_idx:
-                mean_diff = samples_stacked[idx, high_mask].mean() - samples_stacked[idx, low_mask].mean()
-                sign = np.sign(mean_diff) or 1.0
-                signed_scores.append(G_leiden.nodes[idx]['attention'] * sign)
-            signed_scores = np.array(signed_scores)
-            order = np.argsort(signed_scores)[::-1]  # highest positive -> lowest negative
-            ranked_names = [member_names[i] for i in order]
-            ranked_scores = signed_scores[order]
+def plot_specificity_scatter(tc, tname, highlight_idx, path):
+    """Diagnostic: on-class attribution (x) vs off-class attribution (y) for every feature.
+    x > 0, y <= 0: specific evidence for the target; x > 0, y > 0: pushes every sample
+    towards the target (non-specific, penalized in the score); x < 0: counter-evidence."""
+    x_on = node_attr[:n_feature_nodes, tc]
+    y_off = node_off[:n_feature_nodes, tc]
+    fig, ax = plt.subplots(figsize=(7.5, 6.5))
+    for _name in OMIC_NAMES:
+        _sl = slice(OMIC_FEATURE_OFFSETS[_name], OMIC_FEATURE_OFFSETS[_name] + FEATURE_OMIC_SIZES[_name])
+        ax.scatter(x_on[_sl], y_off[_sl], s=10, alpha=0.6, color=OMIC_COLORS[_name], label=_name)
+    if len(highlight_idx):
+        ax.scatter(x_on[highlight_idx], y_off[highlight_idx], s=28, facecolors='none', edgecolors='black',
+                   linewidths=0.6, label='program members')
+    ax.axhline(0, color='#888888', linewidth=0.8)
+    ax.axvline(0, color='#888888', linewidth=0.8)
+    ax.text(0.98, 0.02, 'specific evidence', transform=ax.transAxes, ha='right', va='bottom', fontsize=8, color='#444444')
+    ax.text(0.98, 0.98, 'non-specific (pushes all\nsamples towards target)', transform=ax.transAxes, ha='right',
+            va='top', fontsize=8, color='#444444')
+    ax.text(0.02, 0.5, 'counter-evidence', transform=ax.transAxes, ha='left', va='center', fontsize=8, color='#444444')
+    ax.set_xlabel(f"attr_{tname}: push towards '{tname}' in '{tname}' training samples")
+    ax.set_ylabel(f"attr_off_{tname}: push towards '{tname}' in other training samples")
+    ax.set_title(f"Attribution specificity for '{tname}' (per feature)")
+    ax.legend(fontsize=8, loc='lower left')
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close(fig)
 
-            fig_height = max(10, 5 + 0.28 * len(member_idx))
-            fig = plt.figure(figsize=(15, fig_height))
-            gs_prog = gridspec.GridSpec(2, 3, height_ratios=[1, 1.3], hspace=0.4, wspace=0.35)
 
-            # Panel 1: sample UMAP colored by condition
-            ax0 = fig.add_subplot(gs_prog[0, 0])
+def run_program_analysis(tc):
+    tname = class_names[tc]
+    tag = re.sub(r'[^A-Za-z0-9_.-]+', '_', tname)
+    out_dir = plots_dir + f'programs_{tag}/'
+    supp_dir = supplementary_dir + f'programs_{tag}/'
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(supp_dir, exist_ok=True)
+    is_target = condition_labels == tname
+    print(f"\n=== Programs for target condition '{tname}' -> {out_dir} ===")
+
+    # 1. Features with a positive class-specific score (top <= 300).
+    f_score = node_score[:n_feature_nodes, tc]
+    cand = np.where(f_score > 0)[0]
+    top = cand[np.argsort(f_score[cand])[::-1][:300]]
+    print(f"Programs [{tname}]: {len(cand)} features have a positive score; using the top {len(top)}")
+
+    G_leiden = nx.Graph()
+    for idx in top:
+        G_leiden.add_node(int(idx), name=str(full_node_names.iloc[idx]).strip(), type=FEATURE_INDEX_TO_OMIC[idx],
+                          score=float(node_score[idx, tc]), attr=float(node_attr[idx, tc]),
+                          attr_off=float(node_off[idx, tc]))
+
+    # 2. Edge weights: clip each direction at 0, then add the two directions of a pair.
+    in_top = np.zeros(n_total_nodes, dtype=bool)
+    in_top[top] = True
+    m = in_top[edge_src] & in_top[edge_tgt] & (edge_src != edge_tgt)
+    pair_df = pd.DataFrame({'a': np.minimum(edge_src[m], edge_tgt[m]), 'b': np.maximum(edge_src[m], edge_tgt[m]),
+                            'w': np.maximum(edge_score[m, tc], 0)})
+    pair_df = pair_df.groupby(['a', 'b'], as_index=False)['w'].sum()
+    for a, b, w in zip(pair_df['a'], pair_df['b'], pair_df['w']):
+        if w <= 0:
+            continue
+        ta, tb = G_leiden.nodes[a]['type'], G_leiden.nodes[b]['type']
+        G_leiden.add_edge(int(a), int(b), weight=float(w),
+                          edge_type=f'{ta}-{ta}' if ta == tb else '-'.join(sorted((ta, tb))))
+    isolated = list(nx.isolates(G_leiden))
+    G_leiden.remove_nodes_from(isolated)
+    print(f"Programs [{tname}]: removed {len(isolated)} features without a positive-weight edge; "
+          f"{G_leiden.number_of_nodes()} features, {G_leiden.number_of_edges()} edges left")
+    plot_specificity_scatter(tc, tname, np.array(list(G_leiden.nodes()), dtype=int),
+                             supp_dir + 'attribution_specificity_scatter.pdf')
+
+    if G_leiden.number_of_nodes() == 0 or G_leiden.number_of_edges() == 0:
+        print(f"Programs [{tname}]: no connected top-feature subgraph found, skipping cluster analysis.")
+        return
+
+    # 3. Leiden.
+    nx_nodes = list(G_leiden.nodes())
+    node_id_map = {node: k for k, node in enumerate(nx_nodes)}
+    g_ig = ig.Graph()
+    g_ig.add_vertices(len(nx_nodes))
+    g_ig.add_edges([(node_id_map[u], node_id_map[v]) for u, v in G_leiden.edges()])
+    g_ig.es['weight'] = [G_leiden[u][v]['weight'] for u, v in G_leiden.edges()]
+    partition = leidenalg.find_partition(g_ig, leidenalg.RBConfigurationVertexPartition, weights=g_ig.es['weight'],
+                                         resolution_parameter=args.leiden_resolution, seed=seed)
+    for nx_node, cluster_id in zip(nx_nodes, partition.membership):
+        G_leiden.nodes[nx_node]['leiden_cluster'] = cluster_id
+    node_to_cluster = nx.get_node_attributes(G_leiden, 'leiden_cluster')
+    cluster_sizes = Counter(node_to_cluster.values())
+    valid_clusters = {cid for cid, size in cluster_sizes.items() if size >= args.leiden_min_cluster_size}
+    print(f"Programs [{tname}]: Leiden found {len(cluster_sizes)} clusters, keeping {len(valid_clusters)} "
+          f"with >= {args.leiden_min_cluster_size} features")
+    # P1 = largest program (ties: lower Leiden id first)
+    cids = sorted(valid_clusters, key=lambda c: (-cluster_sizes[c], c))
+    pname = {c: f'P{k + 1}' for k, c in enumerate(cids)}
+
+    def members_of(cid):  # sorted by score, highest first
+        return sorted([n for n, c in node_to_cluster.items() if c == cid],
+                      key=lambda n: -G_leiden.nodes[n]['score'])
+
+    # 4. Program activity (weights from the model, directions from the data).
+    program_activity = pd.DataFrame(index=common_samples)
+    for cid in cids:
+        mem = members_of(cid)
+        w = np.array([G_leiden.nodes[n]['score'] for n in mem])
+        Xc = Z_ACT[mem][:, train_idx]
+        Xc = Xc - Xc.mean(axis=1, keepdims=True)
+        sigma = np.ones(len(mem))
+        if Xc.shape[1] >= 2 and np.any(Xc):
+            u_svd, _, _ = np.linalg.svd(Xc, full_matrices=False)
+            sigma = np.sign(u_svd[:, 0])
+            sigma[sigma == 0] = 1.0
+            if sigma[np.argmax(w)] < 0:
+                sigma = -sigma
+        for n, s_f, w_f in zip(mem, sigma, w):
+            G_leiden.nodes[n]['direction'] = int(s_f)
+            G_leiden.nodes[n]['signed_weight'] = float(w_f * s_f)
+        program_activity[pname[cid]] = (w * sigma) @ Z_ACT[mem] / w.sum()
+    program_activity.index.name = 'ID'
+
+    # Composition CSV (one row per clustered feature).
+    cluster_rows = [{
+        'Feature': d['name'], 'Node_Type': d['type'], 'node': n,
+        f'score_{tname}': d['score'], f'attr_{tname}': d['attr'], f'attr_off_{tname}': d['attr_off'],
+        'Leiden_Cluster': d['leiden_cluster'], 'Program': pname.get(d['leiden_cluster'], ''),
+        'Cluster_Size': cluster_sizes[d['leiden_cluster']],
+        'Kept_In_Network_Plot': d['leiden_cluster'] in valid_clusters,
+        'Activity_direction': d.get('direction', np.nan), 'Activity_weight': d.get('signed_weight', np.nan),
+    } for n, d in G_leiden.nodes(data=True)]
+    cluster_df = pd.DataFrame(cluster_rows).sort_values(['Cluster_Size', 'Leiden_Cluster', f'score_{tname}'],
+                                                         ascending=[False, True, False]).reset_index(drop=True)
+    cluster_df.to_csv(out_dir + 'leiden_clusters_composition.csv', index=False)
+    print(f"Programs [{tname}]: cluster composition saved to {out_dir}leiden_clusters_composition.csv")
+
+    if not valid_clusters:
+        print(f"Programs [{tname}]: no clusters passed the minimum size filter, skipping program plots.")
+        return
+
+    _act_out = program_activity.copy()
+    _act_out.insert(0, 'split', sample_split)
+    _act_out.insert(0, 'CONDITION', condition_labels)
+    _act_out.to_csv(out_dir + 'leiden_program_activity_scores.csv')
+
+    # 5. Statistics: all samples (BH across this condition's programs) + held-out test samples.
+    stat_rows = []
+    for cid in cids:
+        v = program_activity[pname[cid]].values
+        p_all, d_all = _mw(v, is_target)
+        p_te, d_te = _mw(v[is_heldout_test], is_target[is_heldout_test])
+        stat_rows.append({'Program': pname[cid], 'Leiden_Cluster': cid, 'size': cluster_sizes[cid],
+                          'delta_mean_all': d_all, 'p_all': p_all,
+                          'n_target_all': int(is_target.sum()), 'n_rest_all': int((~is_target).sum()),
+                          'delta_mean_test': d_te, 'p_test': p_te,
+                          'n_target_test': int((is_target & is_heldout_test).sum()),
+                          'n_rest_test': int((~is_target & is_heldout_test).sum())})
+    stats_df = pd.DataFrame(stat_rows)
+    stats_df.insert(5, 'q_all', bh_fdr(stats_df['p_all'].values))
+    stats_df['q_test'] = bh_fdr(stats_df['p_test'].values)
+    stats_df.to_csv(out_dir + 'program_statistics.csv', index=False)
+    stats_by = stats_df.set_index('Program')
+
+    # Contracted program network (option-4 style: omic-composition pies, labels beside nodes).
+    G_cluster = nx.Graph()
+    for cid in cids:
+        mem = members_of(cid)
+        types = [G_leiden.nodes[n]['type'] for n in mem]
+        G_cluster.add_node(cid, size=len(mem), dominant_type=max(set(types), key=types.count))
+    acc, acc_types = defaultdict(float), defaultdict(list)
+    for u, v, d in G_leiden.edges(data=True):
+        cu, cv = node_to_cluster[u], node_to_cluster[v]
+        if cu not in valid_clusters or cv not in valid_clusters or cu == cv:
+            continue
+        acc[tuple(sorted((cu, cv)))] += d['weight']
+        acc_types[tuple(sorted((cu, cv)))].append(d['edge_type'])
+    for (cu, cv), w in acc.items():
+        G_cluster.add_edge(cu, cv, weight=w, edge_type=max(set(acc_types[(cu, cv)]), key=acc_types[(cu, cv)].count))
+    pos_c = nx.spring_layout(G_cluster, k=1.2, iterations=500, seed=7, weight='weight')
+    programs_info = []
+    for cid in cids:
+        mem = members_of(cid)
+        types = [G_leiden.nodes[n]['type'] for n in mem]
+        programs_info.append({'key': cid, 'name': pname[cid], 'size': len(mem),
+                              'counts': {t: types.count(t) for t in OMIC_NAMES},
+                              'top': [G_leiden.nodes[n]['name'] for n in mem[:5]]})
+    fig = draw_program_network(
+        programs_info, pos_c, [(u, v, d['weight']) for u, v, d in G_cluster.edges(data=True)], OMIC_NAMES,
+        OMIC_COLORS, f"Multi-omic programs for '{tname}' in the PRAMIGO attention network",
+        f"{len(cids)} Leiden programs (≥ {args.leiden_min_cluster_size} features; "
+        f"{sum(p['size'] for p in programs_info)} features) · node size = features (log) · "
+        f"edge width = summed inter-program score · labels = top 5 features by score_{tname}")
+    fig.savefig(out_dir + "leiden_cluster_network.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+    with PdfPages(out_dir + "leiden_cluster_subgraphs.pdf") as pdf:
+        for cid in cids:
+            fig = draw_cluster_subgraph(G_leiden, cid, pname[cid], tname)
+            if fig is not None:
+                pdf.savefig(fig, bbox_inches='tight', dpi=300)
+                plt.close(fig)
+
+    # Program report: one page per program, 2 x 2 square panels.
+    #   A sample UMAP by condition       B sample UMAP by program activity
+    #   C top members, signed weight     D activity by condition + statistics
+    with PdfPages(out_dir + "leiden_program_activity_report.pdf") as pdf:
+        for cid in cids:
+            pn = pname[cid]
+            activity_values = program_activity[pn].values
+            mem = members_of(cid)
+            st = stats_by.loc[pn]
+            fig = plt.figure(figsize=(10, 10.6))
+            gsr = gridspec.GridSpec(2, 2, left=0.17, right=0.94, bottom=0.12, top=0.88, wspace=0.45, hspace=0.38)
+
+            ax0 = fig.add_subplot(gsr[0, 0])
             for cond in unique_conditions:
-                idx_mask = condition_labels == cond
-                ax0.scatter(cell_nodes_umap[idx_mask, 0], cell_nodes_umap[idx_mask, 1],
-                            color=condition_palette[cond], label=cond, s=20, alpha=0.85)
-            ax0.set_title('Sample UMAP – Condition', fontsize=11)
-            ax0.legend(fontsize=7, markerscale=1.2)
+                mk = condition_labels == cond
+                ax0.scatter(cell_nodes_umap[mk, 0], cell_nodes_umap[mk, 1], color=CONDITION_COLORS[cond],
+                            label=cond, s=22, alpha=0.9, edgecolors='white', linewidths=0.3)
+            ax0.set_title('A  Sample UMAP – condition', fontsize=11, loc='left')
+            ax0.legend(fontsize=7, markerscale=1.2, loc='best')
             ax0.set_xlabel('UMAP1'); ax0.set_ylabel('UMAP2')
+            square_frame(ax0)
 
-            # Panel 2: same UMAP colored by this program's activity score
-            ax1 = fig.add_subplot(gs_prog[0, 1])
-            sc = ax1.scatter(cell_nodes_umap[:, 0], cell_nodes_umap[:, 1],
-                              c=activity_values, cmap='viridis', s=20)
-            plt.colorbar(sc, ax=ax1, fraction=0.046, pad=0.04, label='Activity')
-            ax1.set_title(f'Sample UMAP – Program {cid} Activity', fontsize=11)
+            ax1 = fig.add_subplot(gsr[0, 1])
+            _lim = float(np.nanmax(np.abs(activity_values))) or 1.0
+            sc = ax1.scatter(cell_nodes_umap[:, 0], cell_nodes_umap[:, 1], c=activity_values, cmap='RdBu_r',
+                             norm=mcolors.TwoSlopeNorm(vcenter=0, vmin=-_lim, vmax=_lim), s=26,
+                             edgecolors='black', linewidths=0.3)
+            plt.colorbar(sc, ax=ax1, fraction=0.046, pad=0.04, label=f'{pn} activity')
+            ax1.set_title(f'B  Sample UMAP – {pn} activity', fontsize=11, loc='left')
             ax1.set_xlabel('UMAP1'); ax1.set_ylabel('UMAP2')
+            square_frame(ax1)
 
-            # Panel 3: activity boxplot by condition + non-parametric test/effect size
-            ax2 = fig.add_subplot(gs_prog[0, 2])
-            box_data = [activity_values[condition_labels == cond] for cond in unique_conditions]
-            bp = ax2.boxplot(box_data, labels=unique_conditions, patch_artist=True, showfliers=False)
-            for patch, cond in zip(bp['boxes'], unique_conditions):
-                patch.set_facecolor(condition_palette[cond])
-                patch.set_alpha(0.6)
-            for i, cond in enumerate(unique_conditions):
-                y = activity_values[condition_labels == cond]
-                x = np.random.normal(i + 1, 0.05, size=len(y))
-                ax2.scatter(x, y, s=10, color='black', alpha=0.5, zorder=3)
-            ax2.set_title("\n".join(stats_lines), fontsize=8)
-            ax2.set_xlabel('Condition'); ax2.set_ylabel('Program Activity')
+            ax2 = fig.add_subplot(gsr[1, 0])
+            e = draw_program_members(
+                ax2, [G_leiden.nodes[n]['name'] for n in mem], [G_leiden.nodes[n]['signed_weight'] for n in mem],
+                [G_leiden.nodes[n]['type'] for n in mem], OMIC_NAMES, OMIC_MARKERS_BY_NAME,
+                f'C  {pn} (n = {len(mem)}): signed weight, top 10', n_rows=10, fs=7.5)
+            ax2.set_title(ax2.get_title(loc='left'), fontsize=11, loc='left', fontweight='bold')
+            ax2.set_xlabel(f'score_{tname} × σ (×10$^{{{e}}}$)', fontsize=8)
+            handles = [Patch(fc=plt.get_cmap('RdBu_r')(0.9), ec='black', lw=0.6, label='higher value raises activity'),
+                       Patch(fc=plt.get_cmap('RdBu_r')(0.1), ec='black', lw=0.6, label='higher value lowers activity')]
+            handles += [Line2D([], [], ls='', marker=OMIC_MARKERS_BY_NAME[t], ms=4, color='black', label=t)
+                        for t in OMIC_NAMES[1:]]
+            ax2.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, -0.17), ncol=2, fontsize=6.5,
+                       frameon=False, handlelength=1.2, columnspacing=1.0)
 
-            # Panel 4: decoupleR-style feature contribution barplot
-            ax3 = fig.add_subplot(gs_prog[1, :])
-            max_abs = max(np.max(np.abs(ranked_scores)), 1e-9) if len(ranked_scores) else 1.0
-            bar_norm = mcolors.TwoSlopeNorm(vmin=-max_abs, vcenter=0, vmax=max_abs)
-            bar_cmap = plt.cm.get_cmap('RdBu_r')
-            bar_colors = [bar_cmap(bar_norm(v)) for v in ranked_scores]
-            y_pos = np.arange(len(ranked_names))[::-1]
-            ax3.barh(y_pos, ranked_scores, color=bar_colors, edgecolor='black', linewidth=0.3)
-            ax3.set_yticks(y_pos)
-            ax3.set_yticklabels(ranked_names, fontsize=6)
-            ax3.axvline(0, color='black', linewidth=0.8)
-            ax3.set_xlabel(f'Attention score, signed by direction ({g_low} → {g_high})')
-            ax3.set_title(f'Program {cid} feature contributions ({len(member_idx)} features)', fontsize=11)
+            ax3 = fig.add_subplot(gsr[1, 1])
+            box_conds = [g for g in unique_conditions if np.any(condition_labels == g)]
+            bp = ax3.boxplot([activity_values[condition_labels == g] for g in box_conds], labels=box_conds,
+                             patch_artist=True, showfliers=False, widths=0.55)
+            for patch, cond in zip(bp['boxes'], box_conds):
+                patch.set_facecolor(CONDITION_COLORS[cond])
+                patch.set_alpha(0.55)
+            for med in bp['medians']:
+                med.set_color('black')
+            rng_jit = np.random.RandomState(0)
+            for k_, cond in enumerate(box_conds):
+                mk = condition_labels == cond
+                xj = rng_jit.normal(k_ + 1, 0.06, size=mk.sum())
+                yv = activity_values[mk]
+                held = is_heldout_test[mk]
+                ax3.scatter(xj[~held], yv[~held], s=14, color='black', alpha=0.7, zorder=3)
+                ax3.scatter(xj[held], yv[held], s=18, facecolors='white', edgecolors='black', linewidths=0.8, zorder=4)
+            ax3.set_title(f'D  {pn} activity: {tname} vs rest', fontsize=11, loc='left')
+            ax3.set_xlabel('Condition'); ax3.set_ylabel(f'{pn} activity (SD units)')
+            square_frame(ax3)
+            fmt = lambda x: 'n/a' if not np.isfinite(x) else f'{x:.3g}'
+            ax3.text(0.0, -0.20,
+                     f"All samples ({int(st.n_target_all)} vs {int(st.n_rest_all)}): Δ mean = {fmt(st.delta_mean_all)}, "
+                     f"Mann–Whitney p = {fmt(st.p_all)}, BH q = {fmt(st.q_all)}\n"
+                     f"Held-out test ({int(st.n_target_test)} vs {int(st.n_rest_test)}): Δ mean = {fmt(st.delta_mean_test)}, "
+                     f"p = {fmt(st.p_test)}\n● training/validation sample   ○ held-out test sample",
+                     transform=ax3.transAxes, fontsize=7, va='top', ha='left', color='#333333')
 
-            fig.suptitle(f'Multi-Omic Program {cid} Activity Report', fontsize=15, fontweight='bold')
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
-            pdf.savefig(fig, bbox_inches='tight', dpi=200)
+            fig.text(0.06, 0.955, f"'{tname}' program {pn} (Leiden cluster {cid}, {len(mem)} features)",
+                     fontsize=14, fontweight='bold', va='bottom')
+            fig.text(0.06, 0.945, f"A(s) = Σ w·σ·z(s) / Σ w, w = score_{tname} (attention × gradient, training "
+                     f"samples), z = {ACTIVITY_INPUT} (training mean/SD), σ = sign of the member's loading on the "
+                     "training PC1 (top-weight member +).", fontsize=7.5, color='#4a4a4a', va='top', wrap=True)
+            pdf.savefig(fig)
             plt.close(fig)
-    print(f"Leiden clustering: program activity report saved to {program_report_pdf_path}")
+    print(f"Programs [{tname}]: network, subgraphs, activity scores, statistics and report saved to {out_dir}")
+
+    # Supplementary (per target condition).
+    size_summary = sorted([(pname[cid], G_cluster.nodes[cid]['size'], G_cluster.nodes[cid]['dominant_type'])
+                           for cid in cids], key=lambda t: t[1])
+    fig, ax = plt.subplots(figsize=(7, max(4, 0.35 * len(size_summary))))
+    ax.barh([p for p, _, _ in size_summary], [s_ for _, s_, _ in size_summary],
+            color=[OMIC_COLORS[t] for _, _, t in size_summary], edgecolor='black', linewidth=0.4)
+    ax.set_xlabel('Number of Features')
+    ax.set_title(f"'{tname}' Program Sizes")
+    ax.legend(handles=[Patch(facecolor=OMIC_COLORS[_name], label=f'{_name}-dominant') for _name in OMIC_NAMES],
+              loc='lower right', fontsize=8)
+    plt.tight_layout()
+    plt.savefig(supp_dir + "program_size_ranked.pdf")
+    plt.close(fig)
+
+    labels_p = [pname[c] for c in cids]
+    conn = pd.DataFrame(0.0, index=labels_p, columns=labels_p)
+    for u, v, d in G_cluster.edges(data=True):
+        conn.loc[pname[u], pname[v]] = d['weight']
+        conn.loc[pname[v], pname[u]] = d['weight']
+    fig, ax = plt.subplots(figsize=(max(5, 0.6 * len(cids) + 2), max(4, 0.6 * len(cids) + 2)))
+    sns.heatmap(conn, cmap=SEQ_CMAP, square=True, cbar_kws={'label': 'Sum of class-specific edge weights'}, ax=ax)
+    ax.set_title(f"'{tname}' Inter-Program Connectivity")
+    plt.tight_layout()
+    plt.savefig(supp_dir + "program_connectivity_heatmap.pdf")
+    plt.close(fig)
+
+    with PdfPages(supp_dir + "program_feature_correlation_heatmap.pdf") as pdf:
+        for cid in cids:
+            mem = members_of(cid)
+            if len(mem) < 2:
+                continue
+            names_m = [G_leiden.nodes[n]['name'] for n in mem]
+            corr = np.corrcoef(Z_ACT[mem][:, train_idx]) if len(train_idx) > 1 else np.eye(len(mem))
+            fig, ax = plt.subplots(figsize=(max(5, 0.35 * len(mem) + 2), max(4, 0.35 * len(mem) + 2)))
+            sns.heatmap(corr, cmap=DIV_CMAP, vmin=-1, vmax=1, center=0, xticklabels=names_m, yticklabels=names_m,
+                        cbar_kws={'label': 'Pearson r'}, ax=ax, square=True)
+            ax.tick_params(axis='both', labelsize=6)
+            ax.set_title(f"'{tname}' {pname[cid]}: Feature-Feature Correlation (training samples)")
+            plt.tight_layout()
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+
+    activity_z = (program_activity - program_activity.mean()) / program_activity.std(ddof=0).replace(0, 1)
+    activity_z = activity_z.replace([np.inf, -np.inf], np.nan).fillna(0)
+    row_colors = pd.Series(condition_labels, index=program_activity.index).map(CONDITION_COLORS)
+    row_colors.name = 'Condition'
+    g_act = sns.clustermap(activity_z, cmap=DIV_CMAP, center=0, row_colors=row_colors,
+                           col_cluster=activity_z.shape[1] > 1, row_cluster=activity_z.shape[0] > 1,
+                           figsize=(max(8, 0.5 * activity_z.shape[1] + 3), 9),
+                           cbar_kws={'label': 'Activity (z-score)'}, xticklabels=True, yticklabels=False)
+    g_act.ax_heatmap.set_xlabel('Program')
+    g_act.ax_heatmap.set_ylabel('Sample')
+    g_act.fig.suptitle(f"'{tname}' Program Activity Across Samples", y=1.02)
+    g_act.savefig(supp_dir + "program_activity_heatmap.pdf", bbox_inches='tight')
+    plt.close(g_act.fig)
+    if program_activity.shape[1] > 1:
+        prog_corr = program_activity.corr().fillna(0)
+        g_corr = sns.clustermap(prog_corr, cmap=DIV_CMAP, vmin=-1, vmax=1, center=0,
+                                figsize=(max(6, 0.5 * prog_corr.shape[0] + 3), max(6, 0.5 * prog_corr.shape[0] + 3)),
+                                cbar_kws={'label': 'Pearson r'})
+        g_corr.fig.suptitle(f"'{tname}' Program-Program Activity Correlation", y=1.02)
+        g_corr.savefig(supp_dir + "program_activity_correlation.pdf", bbox_inches='tight')
+        plt.close(g_corr.fig)
+    print(f"Programs [{tname}]: supplementary program figures saved to {supp_dir}")
 
 
+for _tc in TARGET_CLASS_IDX:
+    run_program_analysis(_tc)
 
 
 #-----------------------------------------------------------------------
@@ -2219,12 +2153,14 @@ else:
 #from matplotlib.lines import Line2D
 #from matplotlib.patches import Patch
 
-# Step 1: Select top 100 features per omic by attention
+# Step 1: Select top 100 features per omic by attribution
 top_n = 100
-top_by_omic = {_name: omic_node_attention[_name].sort_values(by='Attention', ascending=False).head(top_n)
+top_by_omic = {_name: omic_node_attribution[_name].sort_values(by='Attribution', ascending=False).head(top_n)
                 for _name in OMIC_NAMES}
-attention_network = pd.concat([df2.iloc[:, [0, 1]], pd.DataFrame(edge_attn.T)],axis=1)
-attention_network.columns = ['source', 'target', 'weight']
+# Edge weight = attention relative to uniform (alpha x in-degree, mean over heads and layers):
+# comparable across targets with different degrees, label-free, and defined for every sample
+# (attribution is computed on training samples only, so it would drop held-out samples).
+attention_network = pd.DataFrame({'source': edge_src, 'target': edge_tgt, 'weight': edge_att_ratio})
 
 # Get all samples
 samples = metadata[['ID', 'CONDITION']].reset_index(drop=True)
@@ -2235,7 +2171,7 @@ node_labels = pd.concat(
     + [samples['ID'].reset_index(drop=True)]
 )
 node_attention = np.concatenate(
-    [top_by_omic[_name]['Attention'].values for _name in OMIC_NAMES]
+    [top_by_omic[_name]['Attribution'].values for _name in OMIC_NAMES]
     + [np.zeros(len(samples))]  # Samples may not have attention scores
 )
 node_types = np.concatenate(
@@ -2252,15 +2188,10 @@ G = nx.Graph()
 
 num_samples = len(samples)
 sample_type_idx = len(OMIC_NAMES)
-# Node ids are offset by each omic's FULL feature count (matching the global feature
-# index used throughout the script - see FEATURE_INDEX_TO_OMIC), not by the top-N
-# subset size, so they line up with attention_network's source/target ids.
-omic_indices = {}
-_cum = 0
-for _name in OMIC_NAMES:
-    omic_indices[_name] = np.array(top_by_omic[_name].index) + _cum
-    _cum += omic_node_attention[_name].shape[0]
-sample_indices = np.array(range(num_samples)) + _cum
+# Node ids are the global node index (each omic's features in manifest order, then
+# the samples), so they line up with attention_network's source/target ids.
+omic_indices = {_name: top_by_omic[_name]['node'].values for _name in OMIC_NAMES}
+sample_indices = np.array(range(num_samples)) + n_feature_nodes
 all_selected_indices = np.concatenate([omic_indices[_name] for _name in OMIC_NAMES] + [sample_indices])
 # Add nodes with attributes
 #for i, (label, shape, node_type, att) in zip(all_selected_indices, zip(node_labels, node_shapes, node_types, node_attention)):
@@ -2303,9 +2234,13 @@ attention_filtered = (
 #max_weight = attention_filtered['weight'].max()
 #attention_filtered['weight_norm'] = attention_filtered['weight'] / max_weight
 
-# Add edges with weights
-for i, j in zip(attention_filtered['source'], attention_filtered['target']):
-    G.add_edge(i, j, weight=1)
+# Add edges with their attribution weight (both directions of a pair are summed, as in
+# the Leiden graph). robust_layout() normalizes these weights for the layout.
+for i, j, w in zip(attention_filtered['source'], attention_filtered['target'], attention_filtered['weight']):
+    if G.has_edge(i, j):
+        G[i][j]['weight'] += float(w)
+    else:
+        G.add_edge(i, j, weight=float(w))
 
 # Step 4: Remove isolated nodes
 isolated_nodes = [node for node in G.nodes if G.degree[node] == 0]
@@ -2474,6 +2409,55 @@ fig.update_layout(
 # Save interactive plot
 fig.write_html(plots_dir + "network_interactive.html")
 
+# Static attention network (network_multiomic.pdf), one page per --network_features_per_omic:
+# the top-N features per omic by attribution plus all samples, edges between them with the
+# same per-edge-type 80th-percentile rule as network_interactive.html. The cutoffs come from
+# the largest N, so every smaller page is a subgraph of the largest one; nodes left without
+# an edge are dropped.
+from pramigo_figures import draw_multiomic_network
+_net_sizes = sorted(set(args.network_features_per_omic))
+_node_type_of = np.concatenate([[name] * FEATURE_OMIC_SIZES[name] for name in OMIC_NAMES] + [['sample'] * sample_len])
+_cond_of_node = np.concatenate([np.full(n_feature_nodes, ''), condition_labels])
+
+def _network_selection(n_top):
+    keep = np.zeros(n_total_nodes, dtype=bool)
+    for _name in OMIC_NAMES:
+        _sel = omic_node_attribution[_name].sort_values('Attribution', ascending=False).head(n_top)
+        keep[_sel['node'].values] = True
+    keep[n_feature_nodes:] = True
+    m_ = keep[edge_src] & keep[edge_tgt] & (edge_src != edge_tgt)
+    e_ = pd.DataFrame({'source': edge_src[m_], 'target': edge_tgt[m_], 'weight': edge_att_ratio[m_]})
+    # undirected: a pair keeps its stronger direction
+    e_[['source', 'target']] = np.sort(e_[['source', 'target']].values, axis=1)
+    e_ = e_.groupby(['source', 'target'], as_index=False)['weight'].max()
+    e_['category'] = [tuple(sorted((_node_type_of[a], _node_type_of[b]))) for a, b in zip(e_.source, e_.target)]
+    return e_
+
+_e_big = _network_selection(_net_sizes[-1])
+_cutoffs = _e_big.groupby('category')['weight'].quantile(0.8).to_dict()
+_lw_all = np.log(_e_big.loc[_e_big.weight >= _e_big.category.map(_cutoffs), 'weight'])
+_lw_range = (float(_lw_all.min()), float(_lw_all.max())) if len(_lw_all) else None
+with PdfPages(plots_dir + "network_multiomic.pdf") as _pdf:
+    for _n in _net_sizes:
+        _e = _network_selection(_n)
+        _e = _e[_e.weight >= _e.category.map(_cutoffs)]
+        _linked = np.unique(np.concatenate([_e.source.values, _e.target.values]))
+        _nodes = pd.DataFrame({'node': _linked, 'label': full_node_names.values[_linked],
+                               'type': _node_type_of[_linked], 'condition': _cond_of_node[_linked]})
+        _fig = draw_multiomic_network(
+            _nodes, _e, OMIC_NAMES, OMIC_COLORS, OMIC_MARKERS_BY_NAME, CONDITION_COLORS, top_n=_n,
+            lw_range=_lw_range,
+            footer_note=(f"Top {_n} features per omic by PRAMIGO attribution (Σ over classes of |attention × gradient|, "
+                         "training samples); edges = HGT attention relative to uniform (α × in-degree, mean of heads "
+                         f"and layers), kept when ≥ the 80th percentile of its edge type in the top-{_net_sizes[-1]} network. "
+                         "Edge colour = omic (grey = between two omics); "
+                         "edge width and opacity scale with log attention; node size scales with degree. Shaded areas: "
+                         "modules (connected components). Labels: 5 features per omic and module with the highest "
+                         "summed edge weight."))
+        _pdf.savefig(_fig, bbox_inches="tight")
+        plt.close(_fig)
+        print(f"network_multiomic: top {_n} per omic -> {len(_nodes)} nodes, {len(_e)} edges")
+
 # Debug: Print graph stats
 print(f"Number of nodes: {len(G.nodes)}")
 print(f"Number of edges: {len(G.edges)}")
@@ -2544,16 +2528,16 @@ print("Supplementary: training-loss diagnostics saved.")
 fig, ax = plt.subplots(figsize=(6.5, 6))
 n_classes = one_hot_labels.shape[1]
 for i in range(n_classes):
-    if one_hot_labels[:, i].sum() == 0:
+    if i not in roc_auc_per_class:  # class absent (or the only class) in the evaluated samples
         continue
-    fpr, tpr, _ = roc_curve(one_hot_labels[:, i], class_probs[:, i])
+    fpr, tpr, _ = roc_curve(eval_one_hot[:, i], class_probs[:, i])
     auc_i = roc_auc_per_class.get(i, np.nan)
     ax.plot(fpr, tpr, color=OKABE_ITO[i % len(OKABE_ITO)], linewidth=1.8,
             label=f'{condition_names[i]} (AUC={auc_i:.2f})')
 ax.plot([0, 1], [0, 1], color='#aaaaaa', linestyle='--', linewidth=1)
 ax.set_xlabel('False Positive Rate')
 ax.set_ylabel('True Positive Rate')
-ax.set_title(f'Per-Class ROC Curves (macro AUC = {roc_auc:.2f})')
+ax.set_title(f'Per-Class ROC Curves - {eval_label}\n(macro AUC = {roc_auc:.2f})')
 ax.legend(loc='lower right', fontsize=8)
 ax.set_aspect('equal')
 plt.tight_layout()
@@ -2573,7 +2557,7 @@ ax.set_xticks(x)
 ax.set_xticklabels(condition_names, rotation=20, ha='right')
 ax.set_ylim(0, 1.05)
 ax.set_ylabel('Score')
-ax.set_title('Per-Class Classification Performance')
+ax.set_title(f'Per-Class Classification Performance - {eval_label}')
 ax.legend(loc='upper right', fontsize=9)
 plt.tight_layout()
 plt.savefig(supplementary_dir + "per_class_performance.pdf")
@@ -2591,13 +2575,13 @@ def _cumulative_pct(values):
 
 fig, ax = plt.subplots(figsize=(7, 5.5))
 for _name in OMIC_NAMES:
-    _rank_pct, _cum_pct = _cumulative_pct(omic_feature_dfs[_name]['Attention'].values)
+    _rank_pct, _cum_pct = _cumulative_pct(omic_feature_dfs[_name]['Attribution'].values)
     ax.plot(_rank_pct, _cum_pct, color=OMIC_COLORS[_name], linewidth=2,
             label=f'{_name} (n={len(omic_feature_dfs[_name])})')
 ax.plot([0, 100], [0, 100], color='#cccccc', linestyle=':', linewidth=1, label='Uniform (no concentration)')
-ax.set_xlabel('Features Ranked by Attention (% of that omic layer)')
-ax.set_ylabel('Cumulative Attention (%)')
-ax.set_title('Attention Concentration by Omic')
+ax.set_xlabel('Features Ranked by Attribution (% of that omic layer)')
+ax.set_ylabel('Cumulative Attribution (%)')
+ax.set_title('Attribution Concentration by Omic')
 ax.legend(loc='lower right', fontsize=9)
 plt.tight_layout()
 plt.savefig(supplementary_dir + "attention_concentration_by_omic.pdf")
@@ -2605,7 +2589,7 @@ plt.close(fig)
 
 # Kruskal-Wallis across every omic when there are more than 2 (Mann-Whitney U is only
 # defined for exactly 2 groups - the original script's fixed comparison).
-_omic_attention_groups = [omic_feature_dfs[_name]['Attention'].values for _name in OMIC_NAMES]
+_omic_attention_groups = [omic_feature_dfs[_name]['Attribution'].values for _name in OMIC_NAMES]
 if len(OMIC_NAMES) == 2:
     _, p_omic = mannwhitneyu(*_omic_attention_groups, alternative='two-sided')
     _stat_label = f'Mann-Whitney U: p={p_omic:.3g}'
@@ -2619,130 +2603,12 @@ for pc, _name in zip(parts['bodies'], OMIC_NAMES):
     pc.set_alpha(0.7)
 ax.set_xticks(range(1, len(OMIC_NAMES) + 1))
 ax.set_xticklabels(OMIC_NAMES)
-ax.set_ylabel('Attention Score')
-ax.set_title(f'Attention Score Distribution by Omic Type\n{_stat_label}')
+ax.set_ylabel('Attribution')
+ax.set_title(f'Attribution Distribution by Omic Type\n{_stat_label}')
 plt.tight_layout()
 plt.savefig(supplementary_dir + "attention_distribution_by_omic.pdf")
 plt.close(fig)
 print("Supplementary: omic-wise attention concentration/distribution saved.")
-
-# ---------------------------------------------------------------------------
-# 4. Leiden program network -> (a) ranked size bars, (b) inter-program connectivity heatmap
-# ---------------------------------------------------------------------------
-if not valid_clusters:
-    print("Supplementary: skipping program-network figures (no valid Leiden clusters).")
-else:
-    size_summary = sorted(
-        [(cid, G_cluster.nodes[cid]['size'], G_cluster.nodes[cid]['dominant_type']) for cid in valid_clusters],
-        key=lambda t: t[1]
-    )
-    prog_labels = [f'Program {cid}' for cid, _, _ in size_summary]
-    prog_sizes = [s for _, s, _ in size_summary]
-    prog_colors = [OMIC_COLORS[t] for _, _, t in size_summary]
-    fig, ax = plt.subplots(figsize=(7, max(4, 0.35 * len(size_summary))))
-    ax.barh(prog_labels, prog_sizes, color=prog_colors, edgecolor='black', linewidth=0.4)
-    ax.set_xlabel('Number of Features')
-    ax.set_title('Multi-Omic Program Sizes')
-    ax.legend(handles=[Patch(facecolor=OMIC_COLORS[_name], label=f'{_name}-dominant') for _name in OMIC_NAMES],
-              loc='lower right', fontsize=8)
-    plt.tight_layout()
-    plt.savefig(supplementary_dir + "program_size_ranked.pdf")
-    plt.close(fig)
-
-    cids = sorted(valid_clusters)
-    conn = pd.DataFrame(0.0, index=[f'P{c}' for c in cids], columns=[f'P{c}' for c in cids])
-    for u, v, edge_data_c in G_cluster.edges(data=True):
-        conn.loc[f'P{u}', f'P{v}'] = edge_data_c['weight']
-        conn.loc[f'P{v}', f'P{u}'] = edge_data_c['weight']
-    fig, ax = plt.subplots(figsize=(max(5, 0.6 * len(cids) + 2), max(4, 0.6 * len(cids) + 2)))
-    sns.heatmap(conn, cmap=SEQ_CMAP, square=True, cbar_kws={'label': 'Attention weight'}, ax=ax)
-    ax.set_title('Inter-Program Connectivity')
-    plt.tight_layout()
-    plt.savefig(supplementary_dir + "program_connectivity_heatmap.pdf")
-    plt.close(fig)
-    print("Supplementary: program size / connectivity figures saved.")
-
-# ---------------------------------------------------------------------------
-# 5. Per-program subgraphs -> (a) unsigned importance ranking, (b) member correlation heatmap
-# ---------------------------------------------------------------------------
-if not valid_clusters:
-    print("Supplementary: skipping per-program feature figures (no valid Leiden clusters).")
-else:
-    # (every omic's features stacked) x samples, same row index as G_leiden node ids
-    # (see the Leiden clustering section above) - recomputed locally since `samples`
-    # was repurposed as a metadata frame in the Network Visualization section above.
-    feature_matrix = np.concatenate([omic_matrices[_name] for _name in OMIC_NAMES], axis=0)
-
-    importance_pdf_path = supplementary_dir + "program_feature_importance_ranked.pdf"
-    with PdfPages(importance_pdf_path) as pdf:
-        for cid in sorted(valid_clusters):
-            member_idx = [n for n, c in node_to_cluster.items() if c == cid]
-            names = [G_leiden.nodes[n]['name'] for n in member_idx]
-            atts = np.array([G_leiden.nodes[n]['attention'] for n in member_idx])
-            order = np.argsort(atts)[::-1]
-            names_r, atts_r = [names[i] for i in order], atts[order]
-            fig, ax = plt.subplots(figsize=(7, max(3, 0.28 * len(names_r))))
-            norm_atts = atts_r / atts_r.max() if atts_r.max() > 0 else atts_r
-            colors_bar = plt.cm.get_cmap(SEQ_CMAP)(norm_atts)
-            y_pos = np.arange(len(names_r))[::-1]
-            ax.barh(y_pos, atts_r, color=colors_bar, edgecolor='black', linewidth=0.3)
-            ax.set_yticks(y_pos)
-            ax.set_yticklabels(names_r, fontsize=7)
-            ax.set_xlabel('Attention Score')
-            ax.set_title(f'Program {cid}: Feature Importance (unsigned)')
-            plt.tight_layout()
-            pdf.savefig(fig, bbox_inches='tight')
-            plt.close(fig)
-    print(f"Supplementary: per-program feature importance saved to {importance_pdf_path}")
-
-    corr_pdf_path = supplementary_dir + "program_feature_correlation_heatmap.pdf"
-    with PdfPages(corr_pdf_path) as pdf:
-        for cid in sorted(valid_clusters):
-            member_idx = [n for n, c in node_to_cluster.items() if c == cid]
-            if len(member_idx) < 2:
-                continue
-            names = [G_leiden.nodes[n]['name'] for n in member_idx]
-            corr = np.corrcoef(feature_matrix[member_idx, :])
-            fig, ax = plt.subplots(figsize=(max(5, 0.35 * len(names) + 2), max(4, 0.35 * len(names) + 2)))
-            sns.heatmap(corr, cmap=DIV_CMAP, vmin=-1, vmax=1, center=0,
-                        xticklabels=names, yticklabels=names,
-                        cbar_kws={'label': 'Pearson r'}, ax=ax, square=True)
-            ax.tick_params(axis='both', labelsize=6)
-            ax.set_title(f'Program {cid}: Feature-Feature Correlation (across samples)')
-            plt.tight_layout()
-            pdf.savefig(fig, bbox_inches='tight')
-            plt.close(fig)
-    print(f"Supplementary: per-program feature correlation heatmaps saved to {corr_pdf_path}")
-
-# ---------------------------------------------------------------------------
-# 6. Program activity -> (a) sample x program heatmap, (b) program-program correlation
-# ---------------------------------------------------------------------------
-if not valid_clusters or program_activity.shape[1] == 0:
-    print("Supplementary: skipping program-activity heatmaps (no valid Leiden clusters).")
-else:
-    activity_std = program_activity.std(ddof=0).replace(0, 1)
-    activity_z = (program_activity - program_activity.mean()) / activity_std
-    activity_z = activity_z.replace([np.inf, -np.inf], np.nan).fillna(0)
-    row_colors = metadata.set_index('ID').loc[program_activity.index, 'CONDITION'].astype(str).map(CONDITION_COLORS)
-    row_colors.name = 'Condition'
-    g_act = sns.clustermap(activity_z, cmap=DIV_CMAP, center=0, row_colors=row_colors,
-                            figsize=(max(8, 0.5 * activity_z.shape[1] + 3), 9),
-                            cbar_kws={'label': 'Activity (z-score)'}, xticklabels=True, yticklabels=False)
-    g_act.ax_heatmap.set_xlabel('Program')
-    g_act.ax_heatmap.set_ylabel('Sample')
-    g_act.fig.suptitle('Program Activity Across Samples', y=1.02)
-    g_act.savefig(supplementary_dir + "program_activity_heatmap.pdf", bbox_inches='tight')
-    plt.close(g_act.fig)
-
-    if program_activity.shape[1] > 1:
-        prog_corr = program_activity.corr().fillna(0)
-        g_corr = sns.clustermap(prog_corr, cmap=DIV_CMAP, vmin=-1, vmax=1, center=0,
-                                 figsize=(max(6, 0.5 * prog_corr.shape[0] + 3), max(6, 0.5 * prog_corr.shape[0] + 3)),
-                                 cbar_kws={'label': 'Pearson r'})
-        g_corr.fig.suptitle('Program-Program Activity Correlation Across Samples', y=1.02)
-        g_corr.savefig(supplementary_dir + "program_activity_correlation.pdf", bbox_inches='tight')
-        plt.close(g_corr.fig)
-    print("Supplementary: program activity heatmaps saved.")
 
 # ---------------------------------------------------------------------------
 # 7. Embeddings -> (a) silhouette score by representation depth, (b) PCA scree
@@ -2802,7 +2668,7 @@ ax.barh(y_pos, top_hubs.values, color=hub_colors, edgecolor='black', linewidth=0
 ax.set_yticks(y_pos)
 ax.set_yticklabels(hub_names, fontsize=7)
 ax.set_xlabel('Degree (number of connections)')
-ax.set_title('Top 20 Hub Nodes in the Attention Network')
+ax.set_title('Top 20 Hub Nodes in the Attribution Network')
 ax.legend(handles=[Patch(facecolor=OMIC_COLORS[_name], label=_name) for _name in OMIC_NAMES] +
                    [Patch(facecolor='#888888', label='Sample')], loc='lower right', fontsize=8)
 plt.tight_layout()

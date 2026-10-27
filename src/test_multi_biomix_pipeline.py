@@ -406,10 +406,11 @@ class TestThreeOmicsFullTopology:
         plots_dir = os.path.join(result_dir, "plots")
         for filename in [
             "training_loss_components.pdf",
-            "Confusion_matrix_figure.pdf",
-            "Interpretability_nodes_attention_figure.pdf",
-            "embeddings_evaluations_figure.pdf",
+            "confusion_matrix.pdf",
+            "interpretability_nodes_attention.pdf",
+            "embeddings_evaluations.pdf",
             "network_interactive.html",
+            "network_multiomic.pdf",
         ]:
             assert os.path.exists(os.path.join(plots_dir, filename)), f"Missing expected output: {filename}"
 

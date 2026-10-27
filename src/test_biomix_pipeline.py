@@ -271,41 +271,77 @@ class TestPipelineEndToEnd:
     def test_attention_csv_saved(self, request, run_fixture_name):
         _, result_dir = request.getfixturevalue(run_fixture_name)
         att_files = [f for f in os.listdir(os.path.join(result_dir, "att")) if f.endswith(".csv")]
-        assert len(att_files) == 1
-        att_df = pd.read_csv(os.path.join(result_dir, "att", att_files[0]))
+        node_files = [f for f in att_files if f.endswith("_node_attribution.csv")]
+        edge_files = [f for f in att_files if f not in node_files]
+        assert len(edge_files) == 1 and len(node_files) == 1
+        att_df = pd.read_csv(os.path.join(result_dir, "att", edge_files[0]))
         assert att_df.shape[0] > 0, "Attention edge table is empty"
+        # post-softmax alphas of every layer, and no duplicated column names
+        assert att_df.columns.is_unique
+        alpha_cols = [c for c in att_df.columns if c.startswith("alpha_L") and "_H" in c]
+        assert alpha_cols and att_df[alpha_cols].min().min() >= 0 and att_df[alpha_cols].max().max() <= 1
+        assert {"alpha_L0_H0", "alpha_L1_H0", "attr_magnitude"} <= set(att_df.columns)
+        node_df = pd.read_csv(os.path.join(result_dir, "att", node_files[0]))
+        assert node_df.shape[0] == 2 * N_FEATURES_PER_OMIC + N_SAMPLES
+
+    def test_heldout_sample_split_and_metrics(self, request, run_fixture_name):
+        _, result_dir = request.getfixturevalue(run_fixture_name)
+        split = pd.read_csv(os.path.join(result_dir, "model", "sample_split.csv"))
+        assert len(split) == N_SAMPLES and split["ID"].is_unique
+        assert set(split["split"]) == {"train", "val", "test"}
+        # stratified: every condition is present in every split
+        assert (split.groupby("split")["CONDITION"].nunique() == split["CONDITION"].nunique()).all()
+        metrics = pd.read_csv(os.path.join(result_dir, "plots", "classification_metrics.csv")).set_index("split")
+        assert metrics.loc["test", "n_samples"] == (split["split"] == "test").sum()
+        assert metrics.loc["all", "n_samples"] == N_SAMPLES
 
     def test_core_visualizations_saved(self, request, run_fixture_name):
         _, result_dir = request.getfixturevalue(run_fixture_name)
         plots_dir = os.path.join(result_dir, "plots")
         expected_always = [
             "training_loss_components.pdf",
-            "Confusion_matrix_figure.pdf",
-            "Interpretability_nodes_attention_figure.pdf",
-            "embeddings_evaluations_figure.pdf",
+            "confusion_matrix.pdf",
+            "interpretability_nodes_attention.pdf",
+            "embeddings_evaluations.pdf",
             "network_interactive.html",
+            "network_multiomic.pdf",
         ]
         for filename in expected_always:
             assert os.path.exists(os.path.join(plots_dir, filename)), f"Missing expected output: {filename}"
 
     def test_leiden_cluster_outputs_if_any_cluster_formed(self, request, run_fixture_name):
-        """With only 40 total candidate features, whether Leiden finds any cluster
-        >= --leiden_min_cluster_size is data/seed-dependent (topology of a tiny
-        correlation graph). This check is intentionally tolerant: if the pipeline
-        itself reported no valid clusters, it skips rather than failing."""
+        """Programs are built per target condition (--target_class; the toy data has no
+        'disease' condition, so every condition gets its own plots/programs_<condition>/).
+        With only 40 candidate features, whether Leiden finds a cluster >= the minimum size
+        for a given condition is data/seed-dependent, so a condition the pipeline reported
+        as cluster-less is skipped; every other one must have the full output set."""
         proc, result_dir = request.getfixturevalue(run_fixture_name)
-        if ("no clusters passed the minimum size filter" in proc.stdout
-                or "no connected top-feature subgraph found" in proc.stdout):
-            pytest.skip("No Leiden clusters formed for this toy dataset/seed - nothing to check.")
         plots_dir = os.path.join(result_dir, "plots")
-        for filename in [
-            "leiden_clusters_composition.csv",
-            "leiden_cluster_network.pdf",
-            "leiden_cluster_subgraphs.pdf",
-            "leiden_program_activity_scores.csv",
-            "leiden_program_activity_report.pdf",
-        ]:
-            assert os.path.exists(os.path.join(plots_dir, filename)), f"Missing expected output: {filename}"
+        program_dirs = sorted(d for d in os.listdir(plots_dir) if d.startswith("programs_"))
+        assert program_dirs, "No per-condition program folder was created"
+        checked = 0
+        for d in program_dirs:
+            tname = d[len("programs_"):]
+            if (f"Programs [{tname}]: no clusters passed the minimum size filter" in proc.stdout
+                    or f"Programs [{tname}]: no connected top-feature subgraph found" in proc.stdout):
+                continue
+            for filename in [
+                "leiden_clusters_composition.csv",
+                "leiden_cluster_network.pdf",
+                "leiden_cluster_subgraphs.pdf",
+                "leiden_program_activity_scores.csv",
+                "leiden_program_activity_report.pdf",
+                "program_statistics.csv",
+            ]:
+                assert os.path.exists(os.path.join(plots_dir, d, filename)), f"Missing expected output: {d}/{filename}"
+            comp = pd.read_csv(os.path.join(plots_dir, d, "leiden_clusters_composition.csv"))
+            assert (comp[f"score_{tname}"] > 0).all(), "program features must have a positive class-specific score"
+            stats = pd.read_csv(os.path.join(plots_dir, d, "program_statistics.csv"))
+            assert set(stats.Program) == set(comp.loc[comp.Kept_In_Network_Plot, "Program"])
+            assert ((stats.q_all >= stats.p_all - 1e-12) | stats.p_all.isna()).all(), "BH q must be >= p"
+            checked += 1
+        if checked == 0:
+            pytest.skip("No Leiden clusters formed for any condition on this toy dataset/seed - nothing to check.")
 
     def test_supplementary_visualizations_saved(self, request, run_fixture_name):
         _, result_dir = request.getfixturevalue(run_fixture_name)

@@ -50,7 +50,7 @@ sample_mode: intersection   # 'intersection' (default) or 'union' - see Sample c
 omics:
   - name: transcriptomics
     path: ./data/rnaseq.tsv
-    rate: 1.0                # optional, defaults to 1.0 - fraction of features sampled per training batch
+    rate: 1.0                # optional, accepted for compatibility but ignored - training always uses every feature
     corr_cutoff: 0.7          # optional, defaults to 0.7 - feature-feature correlation threshold for this omic
     kind: transcriptomics     # optional modality tag, defaults to `name` - see "Same omic twice" below
   - name: methylomics
@@ -91,6 +91,13 @@ python src/biomix_hgt.py --omics_manifest manifest.yaml --metadata_path ... --re
 Tagging two manifest entries with the same `kind` (e.g. two transcriptomics files from different platforms/cohorts of the *same* patients) groups them in reports/plots without merging them into one feature space — each is still its own node type/file. This is safe for the same-cohort, two-platform case. Merging **different cohorts'** data of the same modality is a separate multi-cohort/batch-effect problem (differing sample sets, potential feature-ID mismatches, and a real risk of the graph picking up cohort identity instead of biology) that PRAMIGO_gen does not attempt to solve automatically — do any needed harmonization/batch-correction upstream before feeding the files in.
 
 ---
+
+## 🧪 Training and evaluation protocol
+
+- **Held-out samples.** Before training, samples are split per condition (stratified) into train / val / test (`--val_ratio`, `--test_ratio`, default 15% / 15%, at least one sample per condition in each when the condition has ≥ 3 samples). The split is saved to `model/sample_split.csv`.
+- **Training subgraphs.** `--n_batch` subgraphs, as in DeepMAPS, each holding a random third of the **training** samples. Validation and test samples never enter a training subgraph, so the loss and optimizer never see their labels. The validation loss is computed on the validation samples every epoch, and the model from the epoch with the **lowest validation loss** is the one saved and used for inference and interpretability (marked on `training_loss_components.pdf`). The reported metrics (`confusion_matrix.pdf`, ROC curves, per-class performance) use the test samples only.
+- **Same graph in training and inference.** Every graph the model sees, whether a training subgraph, the validation graph or an inference batch, is built by one function: **all** feature nodes with all their feature–feature edges, plus a subset of sample nodes. Sample nodes only receive messages. So each node has exactly the same neighbourhood (and the same attention softmax) during training as at inference.
+- **What is *not* held out.** The unsupervised preprocessing (the autoencoders and the KNN/correlation masks) is fitted on the omic values of all samples, without labels. This is the usual transductive setting for graph models: no labels leak, but held-out samples' omic values do shape the feature embeddings and the graph.
 
 ## 🚀 Running it
 
@@ -143,14 +150,16 @@ python src/biomix_hgt.py --resume \
   --result_dir "./data/EGA_biomix" --epoch 200
 ```
 
-`--resume` picks up from `<result_dir>/model/checkpoint_latest.pt` and continues until `--epoch`. If no checkpoint exists yet, it just starts fresh. If the checkpoint already reached `--epoch`, it exits immediately rather than doing wasted work.
+`--resume` picks up from `<result_dir>/model/checkpoint_latest.pt` and continues until `--epoch`. If no checkpoint exists yet, it just starts fresh. If the checkpoint already reached `--epoch`, it exits immediately rather than doing wasted work. The checkpoint records the train/val/test sample split, and `--resume` refuses to continue if the current run would produce a different split (or if the checkpoint predates the split), since that would leak held-out samples into training.
 
 ### Key arguments
 
 | Argument | Default | Meaning |
 |---|---|---|
 | `--epoch` | 100 | Number of training epochs |
-| `--n_batch` | 25 | Number of sub-sampled graphs per epoch |
+| `--n_batch` | 32 | Number of training subgraphs per epoch (DeepMAPS-style) |
+| `--val_ratio` | 0.15 | Fraction of samples per condition held out for validation |
+| `--test_ratio` | 0.15 | Fraction of samples per condition held out for the reported test metrics |
 | `--n_hid` | 128 | HGT hidden dimension |
 | `--ae_n_hid` | 256 | Autoencoder hidden dimension (feature reduction step) |
 | `--n_heads` | 8 | Attention heads |
@@ -160,7 +169,9 @@ python src/biomix_hgt.py --resume \
 | `--topology` | `full` | `full` (every omic pair gets direct edges) or `star` (omics only connect through samples) |
 | `--sample_mode` | `intersection` | `intersection` (complete-case) or `union` (partial coverage, missing omics get no edges) |
 | `--omic1_corr_cutoff`, `--omic2_corr_cutoff` | 0.7 | [legacy 2-omic mode] Correlation threshold for building each omic's feature-feature graph edges — use `corr_cutoff:` per-omic in `--omics_manifest` instead |
-| `--leiden_resolution` | 1.5 | Resolution for Leiden clustering of the attention-weighted feature subgraph |
+| `--target_class` | `disease` | Condition(s) whose programs are built, case-insensitive; several allowed (`--target_class PTB PTB_DM`) or `all`. If no condition is called `disease` and the flag isn't given, every condition gets its own programs |
+| `--network_features_per_omic` | 100 | Top features per omic drawn in `network_multiomic.pdf`; several values give one page each (`--network_features_per_omic 10 20 50 100`) |
+| `--leiden_resolution` | 1.5 | Resolution for Leiden clustering of the program feature graph |
 | `--leiden_min_cluster_size` | 3 | Minimum cluster size to keep in the cluster-network plots |
 | `--cuda` | 1 | **`0` runs on GPU 0; any other value runs on CPU** |
 | `--resume` | off | Resume from `<result_dir>/model/checkpoint_latest.pt` |
@@ -176,31 +187,24 @@ Everything is written under `--result_dir`, organized into subfolders:
 
 | Folder | Contents |
 |---|---|
-| `model/` | `checkpoint_latest.pt` (resumable training state) and the final trained model |
-| `loss/` | Per-epoch CSVs: total, validation, cosine, and cross-entropy loss history |
+| `model/` | `checkpoint_latest.pt` (resumable training state), the final trained model, and `sample_split.csv` (which samples were train / val / test) |
+| `loss/` | Per-epoch CSVs (the loss is `0.3·CE + 0.7·cosine`): training total / cross-entropy / cosine (means over that epoch's training subgraphs) and validation loss (held-out validation samples) |
 | `<omic_name>/` (one per omic, named after its manifest `name` — `omic1/`/`omic2/` in legacy 2-omic mode), `sample/` | Learned embedding matrices for each node type |
 | `embeddings/` | Classifier-head embeddings at each hidden layer (128 / 64 / 32-dim) plus final class embeddings |
-| `att/` | Per-node attention scores as CSV — the main interpretability output |
+| `att/` | The main interpretability output: an edge table (`<run>.csv`) and a node table (`<run>_node_attribution.csv`) — see [Interpretability](#-interpretability) |
 | `plots/` | Core visualizations (see below), always generated |
 | `supplementary/` | Additional diagnostic plots, always generated |
 
 **Core visualizations (`plots/`):**
 - `training_loss_components.pdf` — total/validation loss plus loss components over training
-- `Confusion_matrix_figure.pdf` — classification performance on the held-out test split
-- `Interpretability_nodes_attention_figure.pdf` — top attended features per omic
-- `embeddings_evaluations_figure.pdf` — embedding quality diagnostics
+- `confusion_matrix.pdf` — classification performance on the held-out **test samples**; `classification_metrics.csv` has accuracy / F1 / ROC-AUC for the train, val and test samples separately and for all samples together (`all`; optimistic, since it includes training samples)
+- `interpretability_nodes_attention.pdf` — top 10 features per omic and overall, ranked by attribution, plus the cumulative attribution curve
+- `embeddings_evaluations.pdf` — embedding quality diagnostics
 - `network_interactive.html` — interactive, browsable version of the integrated graph
-- `leiden_clusters_composition.csv`, `leiden_cluster_network.pdf`, `leiden_cluster_subgraphs.pdf`, `leiden_program_activity_scores.csv`, `leiden_program_activity_report.pdf` — feature "programs" found by Leiden clustering of the attention subgraph. These only appear if at least one cluster meets `--leiden_min_cluster_size`; on very small graphs it's normal for no cluster to form.
+- `network_multiomic.pdf` — the same attention network as a print-ready figure, one page per `--network_features_per_omic` value: the top-N features per omic (by `Attribution`) and every sample; edges = HGT attention relative to uniform (`attention_ratio` = α × in-degree, mean of heads and layers), kept when ≥ the 80th percentile of their edge type in the largest network (so smaller pages are subgraphs of the largest). Hairline edges coloured by omic (grey between two omics), samples as condition-coloured rings, shaded modules (connected components), 5 labelled features per omic and module. `network_interactive.html` uses the same edge weight.
+- `programs_<condition>/` (one folder per `--target_class`): `leiden_clusters_composition.csv`, `leiden_cluster_network.pdf`, `leiden_cluster_subgraphs.pdf`, `leiden_program_activity_scores.csv`, `leiden_program_activity_report.pdf` — that condition's multi-omic programs (see [Programs](#-programs-per-target-condition)). These only appear if at least one cluster meets `--leiden_min_cluster_size`; on very small graphs it's normal for no cluster to form.
 
-**Supplementary plots (`supplementary/`):** learning-rate schedule, loss-component share over time, ROC curves, per-class performance, attention concentration/distribution by omic layer, embedding separability (silhouette) and PCA scree, plus a hub-node network figure.
-
-### About `leiden_cluster_network.pdf`
-
-**Input:** the *contracted* program graph — one node per Leiden-derived multi-omic program (a cluster of co-attended genes/metabolites), sized by how many features it contains, with edges weighted by the total attention linking one program's members to another's (the exact same numbers also sit in `leiden_clusters_composition.csv` and `supplementary/program_connectivity_heatmap.pdf`).
-
-**Goal:** give a quick, at-a-glance map of how many distinct multi-omic programs were found, their relative sizes, and how strongly they relate to one another — a map of *programs*, not of individual features (that's what `leiden_cluster_subgraphs.pdf` is for).
-
-> ⚠️ **Please look carefully at this figure before relying on it.** Network layouts in Python (Kamada-Kawai/spring-based, as used here) are quite sensitive to the degree and weight distribution of the underlying graph — a small number of programs with widely varying connection strengths can legitimately produce a layout with a few long, stretched-out edges even when the underlying attention data is perfectly valid. If the plot ever looks off to you, please don't take it at face value: cross-check it against the underlying numbers yourself, namely `leiden_clusters_composition.csv` (which features are in which program) and `supplementary/program_connectivity_heatmap.pdf` (the exact attention weight between every pair of programs, as a matrix — no 2D layout involved). We're continuing to look for a better default here, so feedback on this specific plot is very welcome.
+**Supplementary plots (`supplementary/`):** learning-rate schedule, loss-component share over time, ROC curves, per-class performance, attribution concentration/distribution by omic layer, embedding separability (silhouette) and PCA scree, plus a hub-node network figure. `supplementary/programs_<condition>/` adds, per target condition: `attribution_specificity_scatter.pdf` (attr vs attr_off for every feature), program sizes, inter-program connectivity, member correlation, and program activity heatmaps.
 
 ---
 

@@ -137,21 +137,15 @@ class GNN(nn.Module):
             res[idx] = torch.nn.functional.relu(self.adapt_ws[t_id](node_feature[idx]))
         meta_xs = self.drop(res)
         del res
-        self.att = {}
-        i=0
+        # self.att: one post-softmax attention tensor [E, n_heads] per HGT layer (layer 0
+        # first), row-aligned with edge_index. Kept in the autograd graph on purpose so
+        # the caller can compute attention x gradient attributions.
+        self.att = []
         self.emb={}
         for gc in self.gcs:
             meta_xs = gc(meta_xs, node_type, edge_index, edge_type, edge_time)
             if (self.conv_name == 'hgt'):
-                #self.att = gc.res_att
-                self.att[i]=gc.res_att
-                #self.emb[i]=gc.res
-                i=i+1
-                #print(gc.res_att)
-                #for p in gc.parameters():
-                #    print(p)                
-        #self.att = gc.res_att
-        self.att = self.att[0]
+                self.att.append(gc.att)
         class_xs = meta_xs[node_type == self.sample_type_id, ]
         classifier, g_32, g_64, g_128 = self.mlp(class_xs)
         return meta_xs, classifier, g_32, g_64, g_128

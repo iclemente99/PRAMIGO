@@ -114,16 +114,16 @@ class HGTConv(MessagePassing):
                     v_mat = v_linear(source_node_vec).view(-1, self.n_heads, self.d_k)
                     res_msg[idx] = torch.bmm(v_mat.transpose(1,0), self.relation_msg[relation_type]).transpose(1,0)   
         '''
-            Softmax based on target node's id (edge_index_i). Store attention value in self.att for later visualization.
+            Softmax based on target node's id (edge_index_i). The post-softmax weights
+            are what the model actually uses, so they are kept in self.att (one [E, n_heads]
+            tensor, row-aligned with edge_index). It is deliberately NOT detached: the
+            interpretability step differentiates the class logits w.r.t. it
+            (attention x gradient). self.res_att keeps the raw pre-softmax logits, which
+            are only defined up to a per-target shift and must not be read on their own.
         '''
-        #self.att = self.res_att
-        #attention 
-        #self.att =softmax(self.res_att, edge_index_i)
-        #embedding in each layer
-        #res =res_msg * softmax(self.res_att, edge_index_i).view(-1, self.n_heads, 1)
-        res =res_msg * softmax(self.res_att.view(-1, self.n_heads, 1), edge_index_i)
-        #self.res_att=self.att
-        
+        self.att = softmax(self.res_att, edge_index_i)
+        res = res_msg * self.att.view(-1, self.n_heads, 1)
+
         return res.view(-1, self.out_dim)
 
 
@@ -323,6 +323,7 @@ class GeneralConv(nn.Module):
         super(GeneralConv, self).__init__()
         self.conv_name = conv_name
         self.res_att = None
+        self.att = None
         self.res = None
         if self.conv_name == 'hgt':
             self.base_conv = HGTConv(in_hid, out_hid, num_types, num_relations, n_heads, dropout, use_norm, use_RTE)
@@ -336,6 +337,7 @@ class GeneralConv(nn.Module):
         if self.conv_name == 'hgt':
             a=self.base_conv(meta_xs, node_type, edge_index, edge_type, edge_time)
             self.res_att = self.base_conv.res_att
+            self.att = self.base_conv.att
             self.res = self.base_conv.res
             return a
         elif self.conv_name == 'gcn':
