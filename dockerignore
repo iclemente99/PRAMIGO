@@ -1,0 +1,5 @@
+.git
+hgt_env
+__pycache__
+*.pyc
+data/simulated_toy_result

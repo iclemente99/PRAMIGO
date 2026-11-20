@@ -534,8 +534,8 @@ for name in OMIC_NAMES:
 # generalization.
 
 for name in OMIC_NAMES:
-    pd.DataFrame(encoded[name].detach().numpy()).to_csv(os.path.join(embbs_dir, f"ae_{name}_embeddings.csv"))
-pd.DataFrame(encoded2_samples.detach().numpy()).to_csv(os.path.join(embbs_dir, "ae_samples_embeddings.csv"))
+    pd.DataFrame(encoded[name].detach().cpu().numpy()).to_csv(os.path.join(embbs_dir, f"ae_{name}_embeddings.csv"))
+pd.DataFrame(encoded2_samples.detach().cpu().numpy()).to_csv(os.path.join(embbs_dir, "ae_samples_embeddings.csv"))
 debuginfoStr('Feature extraction finished') # Print verbose
 
 
@@ -551,7 +551,7 @@ def compute_binary_correlation_mask(A, B, ae_n_hid, threshold=0.7):
 # Each omic's own feature-feature correlation graph (self_masks[name]).
 self_masks = {}
 for name in OMIC_NAMES:
-    m = compute_binary_correlation_mask(encoded[name].detach().numpy(), encoded[name].detach().numpy(),
+    m = compute_binary_correlation_mask(encoded[name].detach().cpu().numpy(), encoded[name].detach().cpu().numpy(),
                                          args.ae_n_hid, threshold=OMIC_CORR_CUTOFF[name])
     np.fill_diagonal(m, 0)
     self_masks[name] = m
@@ -580,7 +580,7 @@ def compute_knn_mask(A, B, k=100, metric='cosine'):
 # omic <-> sample edges: always computed, regardless of --topology.
 cross_sample_masks = {}
 for name in OMIC_NAMES:
-    m = compute_knn_mask(encoded[name].detach().numpy(), encoded2_samples.detach().numpy(),
+    m = compute_knn_mask(encoded[name].detach().cpu().numpy(), encoded2_samples.detach().cpu().numpy(),
                           k=round(encoded2_samples.shape[0] / 3))
     np.fill_diagonal(m, 0)
     if SAMPLE_MODE == 'union':
@@ -596,7 +596,7 @@ for name in OMIC_NAMES:
 cross_omic_masks = {}
 if TOPOLOGY == 'full':
     for a, b in itertools.combinations(OMIC_NAMES, 2):
-        m = compute_knn_mask(encoded[a].detach().numpy(), encoded[b].detach().numpy(),
+        m = compute_knn_mask(encoded[a].detach().cpu().numpy(), encoded[b].detach().cpu().numpy(),
                               k=round(encoded[b].shape[0] / 3))
         np.fill_diagonal(m, 0)
         cross_omic_masks[(a, b)] = m
@@ -616,8 +616,8 @@ print(_summary)
 #
 ################################################################
 
-node_features_for_graph = {name: encoded[name].detach().numpy() for name in OMIC_NAMES}
-node_features_for_graph['sample'] = encoded2_samples.detach().numpy()
+node_features_for_graph = {name: encoded[name].detach().cpu().numpy() for name in OMIC_NAMES}
+node_features_for_graph['sample'] = encoded2_samples.detach().cpu().numpy()
 graph = build_graph_generic(node_features_for_graph, cross_sample_masks, self_masks, sample_mask,
                              cross_omic_masks, OMIC_NAMES) # Generate graph based in autoencoder and KNN matrix
 debuginfoStr('Build Graph finished') # Print verbose
@@ -1214,7 +1214,7 @@ g64_embeddings = []
 g128_embeddings = []
 class_embeddings = []
 
-node_features_full = {name: encoded[name].detach().numpy() for name in OMIC_NAMES}
+node_features_full = {name: encoded[name].detach().cpu().numpy() for name in OMIC_NAMES}
 
 #with torch.no_grad():
 #with gnn.eval():
@@ -1226,7 +1226,7 @@ for i in range(0, sample_len, ba):
         # feature nodes plus this batch of sample nodes - the N-omic generalization
         # of the original per-omic build_graph()/build_data() calls.
     batch_node_features = dict(node_features_full)
-    batch_node_features['sample'] = encoded2_samples[i:i+ba, :].detach().numpy()
+    batch_node_features['sample'] = encoded2_samples[i:i+ba, :].detach().cpu().numpy()
     batch_cross_sample_masks = {name: cross_sample_masks[name][:, i:i+ba] for name in OMIC_NAMES}
     batch_sample_mask = sample_mask[i:i+ba, i:i+ba]  # sub-mask for current batch
 
@@ -1241,16 +1241,16 @@ for i in range(0, sample_len, ba):
     )
 
     gnn.eval()
-    x = torch.cat([x[name] for name in OMIC_NAMES] + [x['sample']], 0) # Nodes features matrix in tensor format
+    x = torch.cat([x[name] for name in OMIC_NAMES] + [x['sample']], 0).to(device) # Nodes features matrix in tensor format
     x.requires_grad = True
     node_rep, class_rep, g_32, g_64, g_128 = gnn.forward(x,
                                     node_type.to(device),edge_time.to(device),
                                     edge_index.to(device), edge_type.to(device)) # Applies HGT
-    attention.append(gnn.att.detach().numpy()) # Saves attention
+    attention.append(gnn.att.detach().cpu().numpy()) # Saves attention
     for _idx, _name in enumerate(OMIC_NAMES):
-        omic_embedding[_name].append(node_rep[node_type == _idx, ].detach().numpy()) # Extracts this omic's node representations
+        omic_embedding[_name].append(node_rep[node_type == _idx, ].detach().cpu().numpy()) # Extracts this omic's node representations
     sample_matrix = node_rep[node_type == len(OMIC_NAMES), ]
-    sample_embedding.append(sample_matrix.detach().numpy())
+    sample_embedding.append(sample_matrix.detach().cpu().numpy())
     # Choose a scalar objective for gradients
     #score = class_rep.norm()  # or class_rep.mean() or a specific class prediction
     #score.backward()
@@ -1259,10 +1259,10 @@ for i in range(0, sample_len, ba):
     # Grab gradients
     #saliency.append(x.grad.data.abs())  # [N, F] gradient magnitude
     saliency.append(x.grad.abs().cpu().numpy())
-    g32_embeddings.append(g_32.detach().numpy())
-    g64_embeddings.append(g_64.detach().numpy())
-    g128_embeddings.append(g_128.detach().numpy())
-    class_embeddings.append(class_rep.detach().numpy())
+    g32_embeddings.append(g_32.detach().cpu().numpy())
+    g64_embeddings.append(g_64.detach().cpu().numpy())
+    g128_embeddings.append(g_128.detach().cpu().numpy())
+    class_embeddings.append(class_rep.detach().cpu().numpy())
                     
 
 
@@ -1281,7 +1281,7 @@ g128_embeddings = np.vstack(g128_embeddings)
 class_embeddings = np.vstack(class_embeddings)
 
 
-#cell_matrix = cell_matrix.detach().numpy()
+#cell_matrix = cell_matrix.detach().cpu().numpy()
 for name in OMIC_NAMES:
     np.savetxt(omic_dirs[name]+file0, omic_matrix[name], delimiter=' ')
 np.savetxt(sample_dir+file0, sample_matrix, delimiter=' ')
@@ -1424,7 +1424,7 @@ for _oi, _name in enumerate(OMIC_NAMES):
     ], axis=1)
     _df.columns = [f'{_name}_ID', 'Attention']
     omic_node_attention[_name] = _df
-#sample_node_attention = pd.concat([pd.DataFrame(trans.columns[1:]),pd.DataFrame(node_attention_mean[node_type == 2].detach().numpy())], axis=1)
+#sample_node_attention = pd.concat([pd.DataFrame(trans.columns[1:]),pd.DataFrame(node_attention_mean[node_type == 2].detach().cpu().numpy())], axis=1)
 #import mygene
 #mg = mygene.MyGeneInfo()
 #gene_info = mg.querymany(gene_node_attention['Gene_ID'].tolist(), scopes='ensembl.gene', fields='symbol', species='human')
