@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
       ca-certificates \
       build-essential \
+      git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv (same tool used in the README's manual setup)
@@ -14,8 +15,18 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /opt/pramigo
 
-# For now: copy the local repo directly (later this becomes a git clone).
-COPY . .
+# Clone PRAMIGO directly from GitHub (the repository is public).
+# PRAMIGO_REF can be a branch, a tag or - best for reproducible builds -
+# a commit hash. Override at build time, e.g.:
+#   docker build --build-arg PRAMIGO_REF=<commit-hash> -t biomix-pramigo:test .
+# Note: Docker caches this step. If PRAMIGO_REF is a branch name and the
+# branch gets new commits, rebuild with --no-cache (or pass a commit hash).
+ARG PRAMIGO_REPO=https://github.com/iclemente99/PRAMIGO.git
+ARG PRAMIGO_REF=Implementation_Docker
+RUN git init . \
+ && git remote add origin "${PRAMIGO_REPO}" \
+ && git fetch --depth 1 origin "${PRAMIGO_REF}" \
+ && git checkout FETCH_HEAD
 
 # uv downloads its own Python 3.8 build if needed - independent of the OS's
 # default Python - then installs the pinned dependencies into that venv.

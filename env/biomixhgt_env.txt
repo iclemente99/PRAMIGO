@@ -19,6 +19,7 @@ dill
 tqdm==4.66.2
 python-igraph
 leidenalg
+pyyaml        # needed by src/omics_manifest.py to read --omics_manifest .yaml (3+ omics, written by BiomiX)
 
 # Testing only (not needed to run biomix_hgt.py itself)
 pytest
