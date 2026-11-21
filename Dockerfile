@@ -30,7 +30,20 @@ RUN git init . \
 
 # uv downloads its own Python 3.8 build if needed - independent of the OS's
 # default Python - then installs the pinned dependencies into that venv.
-RUN uv venv hgt_env --python 3.8 && uv pip install --python hgt_env/bin/python --index-url https://download.pytorch.org/whl/cu117 torch==1.13.1 && uv pip install --python hgt_env/bin/python -r env/biomixhgt_env.txt
+#
+# torch build depends on the target architecture (set automatically by
+# docker buildx / BuildKit):
+#   - amd64 (Windows/Linux, NVIDIA GPU possible): CUDA 11.7 build of torch.
+#   - arm64 (e.g. Apple Silicon Macs): no CUDA build exists, so the standard
+#     CPU-only torch from PyPI is used. PRAMIGO then runs on CPU (--cuda 1).
+ARG TARGETARCH
+RUN uv venv hgt_env --python 3.8 \
+ && if [ "${TARGETARCH}" = "arm64" ]; then \
+      uv pip install --python hgt_env/bin/python torch==1.13.1 ; \
+    else \
+      uv pip install --python hgt_env/bin/python --index-url https://download.pytorch.org/whl/cu117 torch==1.13.1 ; \
+    fi \
+ && uv pip install --python hgt_env/bin/python -r env/biomixhgt_env.txt
 
 # So `python`, `pytest`, etc. resolve to the venv by default when you exec
 # into the container or override the entrypoint.
